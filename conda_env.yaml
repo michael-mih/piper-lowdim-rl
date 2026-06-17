@@ -1,0 +1,23 @@
+name: piper_mujoco
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pip
+  - setuptools>=61
+  - wheel
+  - patchelf
+  - gcc_linux-64=9.5.0
+  - gxx_linux-64=9.5.0
+  - libxcrypt
+  - pip:
+      - cffi==1.17.1
+      - cython==0.29.36
+      - fasteners==0.20
+      - glfw==2.10.0
+      - imageio==2.35.1
+      - mujoco-py==2.1.2.14
+      - numpy==1.24.4
+      - --no-build-isolation
+      - -e .
