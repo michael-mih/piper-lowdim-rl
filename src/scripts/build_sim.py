@@ -102,7 +102,7 @@ ET.SubElement(
         "type": "box",
         "size": box_half_extents,
         "rgba": "0.9 0.15 0.08 1",
-        "mass": "0.2",
+        "mass": "0.05",
         "friction": "1 0.005 0.0001",
     },
 )

@@ -10,11 +10,15 @@ requires-python = ">=3.8"
 
 [project.scripts]
 train-policy = "scripts.train_policy:main"
+train-ppo-grasp = "scripts.train_ppo_grasp:main"
+
+[project.optional-dependencies]
+ppo = ["torch"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["controllers*", "scripts*"]
+include = ["controllers*", "learning*", "scripts*"]
 namespaces = true

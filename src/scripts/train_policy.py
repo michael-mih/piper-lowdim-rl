@@ -50,6 +50,7 @@ def main():
     gripper_delta = 0.0001
     while 1:
         controller.send_joint_angle_cmd(target_angles)
+        #example gripper movement
         target_angles[6] -= gripper_delta
         target_angles[7] += gripper_delta
 
@@ -58,6 +59,7 @@ def main():
             break 
         if controller.get_force_left() > 1.2:
             gripper_delta = 0
+            #example joint 5 movement
             target_angles[4] = -1.2
         time.sleep(0.01)
         

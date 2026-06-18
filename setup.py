@@ -8,12 +8,16 @@ setup(
     package_dir={"": "src"},
     packages=find_namespace_packages(
         where="src",
-        include=["controllers*", "scripts*"],
+        include=["controllers*", "learning*", "scripts*"],
     ),
     python_requires=">=3.8",
+    extras_require={
+        "ppo": ["torch"],
+    },
     entry_points={
         "console_scripts": [
             "train-policy=scripts.train_policy:main",
+            "train-ppo-grasp=scripts.train_ppo_grasp:main",
         ],
     },
 )

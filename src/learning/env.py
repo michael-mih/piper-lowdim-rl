@@ -1,0 +1,412 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
+
+import numpy as np
+
+
+class GraspAction(IntEnum):
+    CLOSE_GRIPPER = 0
+    HOLD_GRIPPER = 1
+    OPEN_GRIPPER = 2
+    LIFT_JOINT5 = 3
+    LOWER_JOINT5 = 4
+
+
+@dataclass
+class ObservationConfig:
+    min_force_threshold_n: float = 1.0
+    calibration_max_steps: int = 200
+    calibration_force_mode: str = "average"
+    normalize: bool = True
+    max_force_n: float = 5.0
+    max_stiffness_n_per_m: float = 1000.0
+    max_gripper_gap_m: float = 0.07
+    gripper_gap_epsilon_m: float = 1e-4
+    sensor_offset_range: float = 0.0
+    sensor_noise_std: float = 0.0
+    motor_offset_range: float = 0.0
+
+
+@dataclass
+class RewardConfig:
+    desired_force_min_n: float = 1.0
+    desired_force_max_n: float = 4.0
+    terminate_force_n: float = 5.0
+    force_reward: float = 0.0008
+    force_penalty: float = -0.0008
+    lift_reward_height_m: float = 0.0
+    lift_reward: float = 0.0008
+    high_lift_reward_height_m: float = 0.015
+    high_lift_reward: float = 0.0016
+    success_lift_height_m: float = 0.020
+    success_reward: float = 1.0
+    failure_penalty: float = -1.0
+    step_penalty: Optional[float] = None
+    out_of_bounds_radius_m: float = 0.25
+
+
+@dataclass
+class GraspEnvConfig:
+    initial_joint_angles: Tuple[float, ...] = (0.0, 1.5, -0.3, 0.0, -1.0, 0.0, 0.03, -0.03)
+    max_steps: int = 250
+    settle_steps: int = 5
+    control_steps_per_action: int = 4
+    gripper_delta_m: float = 0.0005
+    joint5_lift_delta_rad: float = -0.01
+    joint5_lower_delta_rad: float = 0.01
+    joint5_index: int = 4
+    left_gripper_index: int = 6
+    right_gripper_index: int = 7
+    default_body_name: str = "grasp_box"
+
+
+ObjectHeightFn = Callable[[Any], Optional[float]]
+ObjectPositionFn = Callable[[Any], Optional[Sequence[float]]]
+
+
+class GraspPPOEnv:
+    """Small controller-backed grasping environment for discrete PPO.
+
+    The environment deliberately avoids a Gym dependency. It exposes a familiar
+    reset/step interface and keeps robot-specific assumptions configurable.
+    """
+
+    num_actions = len(GraspAction)
+    observation_names = (
+        "left_force_n",
+        "right_force_n",
+        "stiffness_n_per_m",
+        "gripper_gap_m",
+        "joint5_position",
+    )
+
+    def __init__(
+        self,
+        controller: Any,
+        env_config: Optional[GraspEnvConfig] = None,
+        observation_config: Optional[ObservationConfig] = None,
+        reward_config: Optional[RewardConfig] = None,
+        object_height_fn: Optional[ObjectHeightFn] = None,
+        object_position_fn: Optional[ObjectPositionFn] = None,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.controller = controller
+        self.env_config = env_config or GraspEnvConfig()
+        self.observation_config = observation_config or ObservationConfig()
+        self.reward_config = reward_config or RewardConfig()
+        self.object_height_fn = object_height_fn
+        self.object_position_fn = object_position_fn
+        self.rng = np.random.default_rng(seed)
+
+        self.steps = 0
+        self.done = False
+        self.stiffness_n_per_m = 0.0
+        self.last_info: Dict[str, Any] = {}
+        self._initial_object_height: Optional[float] = None
+        self._initial_object_xy: Optional[np.ndarray] = None
+        self._sensor_offset = 0.0
+        self._motor_offset = 0.0
+
+    @property
+    def observation_dim(self) -> int:
+        return len(self.observation_names)
+
+    def reset(self) -> np.ndarray:
+        self.steps = 0
+        self.done = False
+        self.last_info = {}
+        self._sensor_offset = self._sample_offset(self.observation_config.sensor_offset_range)
+        self._motor_offset = self._sample_offset(self.observation_config.motor_offset_range)
+
+        self.controller.set_initial_position(list(self.env_config.initial_joint_angles))
+        self._run_controller_steps(self.env_config.settle_steps)
+        calibration_info = self._calibrate_stiffness()
+
+        self._initial_object_height = self._read_object_height()
+        pos = self._read_object_position()
+        self._initial_object_xy = None if pos is None else np.asarray(pos[:2], dtype=np.float32)
+
+        self.last_info = {"calibration": calibration_info}
+        return self.observe()
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        if self.done:
+            return self.observe(), 0.0, True, {"already_done": True, **self.last_info}
+
+        grasp_action = GraspAction(int(action))
+        command = self._apply_action(self._current_command(), grasp_action)
+        self.controller.send_joint_angle_cmd(command)
+        self._run_controller_steps(self.env_config.control_steps_per_action)
+        
+        self.steps += 1
+        reward, terminated, reward_info = self._reward()
+        truncated = self.steps >= self.env_config.max_steps and not terminated
+        self.done = terminated or truncated
+
+        info = {
+            "action": grasp_action.name,
+            "terminated": terminated,
+            "truncated": truncated,
+            **reward_info,
+        }
+        self.last_info = info
+        return self.observe(), reward, self.done, info
+
+    def observe(self) -> np.ndarray:
+        raw = self.observation_dict()
+        values = np.array([raw[name] for name in self.observation_names], dtype=np.float32)
+        if not self.observation_config.normalize:
+            return values
+
+        normalized = np.array(
+            [
+                self._normalize_positive(raw["left_force_n"], self.observation_config.max_force_n),
+                self._normalize_positive(raw["right_force_n"], self.observation_config.max_force_n),
+                self._normalize_positive(
+                    raw["stiffness_n_per_m"],
+                    self.observation_config.max_stiffness_n_per_m,
+                ),
+                self._normalize_positive(raw["gripper_gap_m"], self.observation_config.max_gripper_gap_m),
+                self._normalize_joint5(raw["joint5_position"]),
+            ],
+            dtype=np.float32,
+        )
+
+        normalized[:3] += self._sensor_offset
+        normalized[3:] += self._motor_offset
+        if self.observation_config.sensor_noise_std > 0:
+            normalized[:3] += self.rng.normal(0.0, self.observation_config.sensor_noise_std, size=3)
+        return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+
+    def observation_dict(self) -> Dict[str, float]:
+        left_force, right_force = self._read_forces()
+        command = self._current_command()
+        return {
+            "left_force_n": left_force,
+            "right_force_n": right_force,
+            "stiffness_n_per_m": self.stiffness_n_per_m,
+            "gripper_gap_m": self._gripper_gap(command),
+            "joint5_position": float(command[self.env_config.joint5_index]),
+        }
+
+    def _calibrate_stiffness(self) -> Dict[str, Any]:
+        command = self._current_command()
+        reached_threshold = False
+        left_force = 0.0
+        right_force = 0.0
+
+        for step_idx in range(self.observation_config.calibration_max_steps):
+            left_force, right_force = self._read_forces()
+            if self._calibration_force_met(left_force, right_force):
+                reached_threshold = True
+                break
+            command = self._apply_action(command, GraspAction.CLOSE_GRIPPER)
+            self.controller.send_joint_angle_cmd(command)
+            self._run_controller_steps(1)
+        else:
+            step_idx = self.observation_config.calibration_max_steps
+
+        left_force, right_force = self._read_forces()
+        gap = max(self._gripper_gap(self._current_command()), self.observation_config.gripper_gap_epsilon_m)
+        force_for_stiffness = (
+            self.observation_config.min_force_threshold_n
+            if reached_threshold
+            else max((left_force + right_force) * 0.5, 0.0)
+        )
+        self.stiffness_n_per_m = force_for_stiffness / gap
+
+        return {
+            "reached_threshold": reached_threshold,
+            "steps": step_idx,
+            "left_force_n": left_force,
+            "right_force_n": right_force,
+            "gripper_gap_m": gap,
+            "stiffness_n_per_m": self.stiffness_n_per_m,
+        }
+
+    def _reward(self) -> Tuple[float, bool, Dict[str, Any]]:
+        cfg = self.reward_config
+        step_penalty = cfg.step_penalty
+        if step_penalty is None:
+            step_penalty = -1.0 / float(self.env_config.max_steps)
+
+        left_force, right_force = self._read_forces()
+        reward = float(step_penalty)
+        terminated = False
+        reason = None
+
+        for sensor_name, force in (("left", left_force), ("right", right_force)):
+            if force >= cfg.terminate_force_n:
+                reward += cfg.failure_penalty
+                terminated = True
+                reason = f"{sensor_name}_force_limit"
+            elif cfg.desired_force_min_n <= force < cfg.desired_force_max_n:
+                reward += cfg.force_reward
+            elif cfg.desired_force_max_n <= force < cfg.terminate_force_n:
+                reward += cfg.force_penalty
+
+        lift_height = self._object_lift_height()
+        if lift_height is not None:
+            if lift_height > cfg.lift_reward_height_m:
+                reward += cfg.lift_reward
+            if lift_height > cfg.high_lift_reward_height_m:
+                reward += cfg.high_lift_reward
+
+        if not terminated and self._object_out_of_bounds():
+            reward += cfg.failure_penalty
+            terminated = True
+            reason = "object_out_of_bounds"
+
+        success = False
+        if not terminated and self._is_success(left_force, right_force, lift_height):
+            reward += cfg.success_reward
+            terminated = True
+            success = True
+            reason = "success"
+
+        return reward, terminated, {
+            "reason": reason,
+            "success": success,
+            "left_force_n": left_force,
+            "right_force_n": right_force,
+            "object_lift_height_m": lift_height,
+            "stiffness_n_per_m": self.stiffness_n_per_m,
+        }
+
+    def _is_success(self, left_force: float, right_force: float, lift_height: Optional[float]) -> bool:
+        cfg = self.reward_config
+        if lift_height is None:
+            return False
+        average_force = 0.5 * (left_force + right_force)
+        return (
+            lift_height > cfg.success_lift_height_m
+            and average_force >= cfg.desired_force_min_n
+            and left_force < cfg.desired_force_max_n
+            and right_force < cfg.desired_force_max_n
+        )
+
+    def _calibration_force_met(self, left_force: float, right_force: float) -> bool:
+        threshold = self.observation_config.min_force_threshold_n
+        mode = self.observation_config.calibration_force_mode
+        if mode == "both":
+            return left_force >= threshold and right_force >= threshold
+        if mode == "either":
+            return left_force >= threshold or right_force >= threshold
+        if mode != "average":
+            raise ValueError("calibration_force_mode must be 'average', 'both', or 'either'")
+        return 0.5 * (left_force + right_force) >= threshold
+
+    def _apply_action(self, command: Sequence[float], action: GraspAction) -> list[float]:
+        next_command = list(command)
+        cfg = self.env_config
+
+        if action == GraspAction.CLOSE_GRIPPER:
+            next_command[cfg.left_gripper_index] -= cfg.gripper_delta_m
+            next_command[cfg.right_gripper_index] += cfg.gripper_delta_m
+        elif action == GraspAction.OPEN_GRIPPER:
+            next_command[cfg.left_gripper_index] += cfg.gripper_delta_m
+            next_command[cfg.right_gripper_index] -= cfg.gripper_delta_m
+        elif action == GraspAction.LIFT_JOINT5:
+            next_command[cfg.joint5_index] += cfg.joint5_lift_delta_rad
+        elif action == GraspAction.LOWER_JOINT5:
+            next_command[cfg.joint5_index] += cfg.joint5_lower_delta_rad
+
+        for idx in (cfg.joint5_index, cfg.left_gripper_index, cfg.right_gripper_index):
+            next_command[idx] = self._clamp_joint(idx, next_command[idx])
+        return next_command
+
+    def _current_command(self) -> list[float]:
+        try:
+            command = self.controller.get_joint_angle_cmd()
+            if command:
+                return list(command)
+        except Exception:
+            pass
+        return list(self.controller.get_joint_angles())
+
+    def _clamp_joint(self, joint_index: int, value: float) -> float:
+        bounds = getattr(self.controller, "joint_bounds", None)
+        if bounds and len(bounds) >= (joint_index * 2 + 2):
+            lo = float(bounds[joint_index * 2])
+            hi = float(bounds[joint_index * 2 + 1])
+            return max(lo, min(float(value), hi))
+        if joint_index == self.env_config.left_gripper_index:
+            return max(0.0, min(float(value), 0.035))
+        if joint_index == self.env_config.right_gripper_index:
+            return max(-0.035, min(float(value), 0.0))
+        if joint_index == self.env_config.joint5_index:
+            return max(-1.22, min(float(value), 1.22))
+        return float(value)
+
+    def _gripper_gap(self, command: Sequence[float]) -> float:
+        return abs(
+            float(command[self.env_config.left_gripper_index])
+            - float(command[self.env_config.right_gripper_index])
+        )
+
+    def _read_forces(self) -> Tuple[float, float]:
+        return max(0.0, float(self.controller.get_force_left())), max(
+            0.0,
+            float(self.controller.get_force_right()),
+        )
+
+    def _read_object_height(self) -> Optional[float]:
+        if self.object_height_fn is not None:
+            height = self.object_height_fn(self.controller)
+            return None if height is None else float(height)
+        pos = self._default_body_position()
+        return None if pos is None else float(pos[2])
+
+    def _read_object_position(self) -> Optional[np.ndarray]:
+        if self.object_position_fn is not None:
+            pos = self.object_position_fn(self.controller)
+            return None if pos is None else np.asarray(pos, dtype=np.float32)
+        return self._default_body_position()
+
+    def _default_body_position(self) -> Optional[np.ndarray]:
+        sim = getattr(self.controller, "sim", None)
+        if sim is None:
+            return None
+        try:
+            return np.asarray(sim.data.get_body_xpos(self.env_config.default_body_name), dtype=np.float32)
+        except Exception:
+            return None
+
+    def _object_lift_height(self) -> Optional[float]:
+        current_height = self._read_object_height()
+        if current_height is None or self._initial_object_height is None:
+            return None
+        return float(current_height - self._initial_object_height)
+
+    def _object_out_of_bounds(self) -> bool:
+        current_pos = self._read_object_position()
+        if current_pos is None or self._initial_object_xy is None:
+            return False
+        distance = np.linalg.norm(np.asarray(current_pos[:2], dtype=np.float32) - self._initial_object_xy)
+        return bool(distance > self.reward_config.out_of_bounds_radius_m)
+
+    def _run_controller_steps(self, steps: int) -> None:
+        for _ in range(max(0, int(steps))):
+            self.controller.step()
+
+    def _normalize_positive(self, value: float, maximum: float) -> float:
+        if maximum <= 0:
+            return 0.0
+        clipped = max(0.0, min(float(value), maximum))
+        return 2.0 * (clipped / maximum) - 1.0
+
+    def _normalize_joint5(self, value: float) -> float:
+        lo = self._clamp_joint(self.env_config.joint5_index, -1.22)
+        hi = self._clamp_joint(self.env_config.joint5_index, 1.22)
+        if hi <= lo:
+            return 0.0
+        clipped = max(lo, min(float(value), hi))
+        return 2.0 * ((clipped - lo) / (hi - lo)) - 1.0
+
+    def _sample_offset(self, offset_range: float) -> float:
+        if offset_range <= 0:
+            return 0.0
+        return float(self.rng.uniform(-offset_range, offset_range))
