@@ -7,3 +7,7 @@ piper_force_rl.egg-info/
 __pycache__/
 *.pt
 background/
+TEST*.py
+!src/scripts/TEST_min_grasp_fsm.py
+*.csv
+*.png

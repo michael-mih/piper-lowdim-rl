@@ -5,13 +5,17 @@ import time
 import glfw  # 用于检查窗口关闭事件
 
 class SimController(Controller):
-    def __init__(self, pid_controllers, model_path):
-        from mujoco_py import load_model_from_path, MjSim, MjViewer
+    def __init__(self, pid_controllers, model_path, render=True):
+        from mujoco_py import load_model_from_path, MjSim
 
         super().__init__(pid_controllers=pid_controllers)
         model = load_model_from_path(model_path)
         self.sim = MjSim(model)
-        self.viewer = MjViewer(self.sim)
+        self.viewer = None
+        if render:
+            from mujoco_py import MjViewer
+
+            self.viewer = MjViewer(self.sim)
         self.joint_bounds = [-2.618, 2.168, 0, 3.14, -2.967, 0, -1.745, 1.745, -1.22, 1.22, -2.0944, 2.0944, 0, 0.035, -0.035, 0]
         self.target_angles = self.get_joint_angles()
         
@@ -81,6 +85,7 @@ class SimController(Controller):
             clamped_cmds.append(max(self.joint_bounds[i*2], min(cmds[i], self.joint_bounds[i*2+1])))
         self.target_angles = clamped_cmds
     
+
     def get_joint_angle_cmd(self):
         return self.target_angles
     
@@ -110,7 +115,8 @@ class SimController(Controller):
             self.sim.data.ctrl[i] = self.target_angles[i]
         self.sim.step()
         self._mark_dropped_passive_objects()
-        self.viewer.render()
+        if self.viewer is not None:
+            self.viewer.render()
 
     def get_sensor_value(self, sensor_name):
         sensor_id = self.sim.model.sensor_name2id(sensor_name)

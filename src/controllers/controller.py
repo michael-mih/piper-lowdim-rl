@@ -16,6 +16,8 @@ class Controller(ABC):
     def send_joint_angle_cmd(self, cmds: list[float]) -> None:
         pass
     
+
+
     #current command
     @abstractmethod
     def get_joint_angle_cmd(self) -> list[float]:
@@ -44,3 +46,5 @@ class Controller(ABC):
 
     def get_force_average(self) -> float:
         return (self.get_force_left() + self.get_force_right()) / 2
+
+    

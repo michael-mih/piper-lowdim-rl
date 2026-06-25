@@ -35,17 +35,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--train-iters", type=int, default=80)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="PyTorch device (auto, cpu, cuda, or cuda:N).",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--min-force", type=float, default=1.0)
     parser.add_argument("--max-steps", type=int, default=250)
+    parser.add_argument(
+        "--no-render",
+        action="store_true",
+        help="Disable the MuJoCo viewer and run simulation as fast as possible.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    device = args.device
+    if device == "auto":
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    elif device.startswith("cuda"):
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Requested PyTorch device {device!r}, but CUDA is not available."
+            )
+
+    print(f"training_device={device}")
     controller = SimController(
         pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)],
         model_path=args.model_path,
+        render=not args.no_render,
     )
     env = GraspPPOEnv(
         controller=controller,
@@ -61,6 +86,7 @@ def main() -> None:
         rollout_steps=args.rollout_steps,
         batch_size=args.batch_size,
         train_iters=args.train_iters,
+        device=device,
     )
     agent = PPOAgent(config)
     trainer = PPOTrainer(env, agent, config)

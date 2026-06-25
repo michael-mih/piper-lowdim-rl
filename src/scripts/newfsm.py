@@ -1,11 +1,12 @@
 from controllers.sim_controller import SimController
 from scripts.build_sim import combined_xml
-
+from fsm.custom_min_grasp_fsm import FSMActor
 import os 
 import argparse
 
 import glfw  # 用于检查窗口关闭事件
 import time
+import asyncio
 
 # 定义PID控制器类
 class PIDController:
@@ -44,23 +45,46 @@ def main():
     else:
         pass
     
+    fsmActor = FSMActor(controller=controller)
     count = 0
-    target_angles = [0, 1.5, -0.3, 0, -1.0, 0, 0.03, -0.03]
+    target_angles = [0, 1.5, -0.3, 0, -0.7, 0, 0.03, -0.03]
     controller.set_initial_position(target_angles)
     gripper_delta = 0.0001
-    while 1:
+    arm_delta = 0.001
+    while target_angles[4]>-1.2:
         controller.send_joint_angle_cmd(target_angles)
+        controller.step()
+        if min(controller.get_force_left(), controller.get_force_right()) > 0.8:
+            gripper_delta = 0
+            #example joint 5 movement
+            #target_angles[4] = -1.2
+        if gripper_delta == 0:
+            if target_angles[4] > -1.2:
+                target_angles[4]-=arm_delta
         #example gripper movement
         target_angles[6] -= gripper_delta
         target_angles[7] += gripper_delta
-
-        controller.step()
         if True and glfw.window_should_close(controller.viewer.window):
             break 
-        if controller.get_force_left() > 1.2:
-            gripper_delta = 0
-            #example joint 5 movement
-            target_angles[4] = -1.2
+        
         time.sleep(0.01)
-        
-        
+
+    
+    increment = 0.00001
+    while True:
+        fsmActor.step()
+        if fsmActor.is_converged(10):
+            break
+        if fsmActor.is_slip():
+            fsmActor.tighten(increment)
+        else:
+            fsmActor.loosen(increment)
+        #print(controller.get_force_average())
+        if True and glfw.window_should_close(controller.viewer.window):
+            break 
+        time.sleep(0.01)
+
+    print("converged at " + str(fsmActor.min))
+    
+if __name__ == "__main__":
+    main()

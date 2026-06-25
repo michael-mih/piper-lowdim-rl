@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
@@ -25,11 +26,11 @@ class PPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.97
     clip_ratio: float = 0.2
-    train_iters: int = 80
+    train_iters: int = 20
     batch_size: int = 256
     rollout_steps: int = 6000
     target_kl: float = 0.01
-    entropy_coef: float = 0.0
+    entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     device: str = "cpu"
@@ -83,7 +84,13 @@ else:
 
 
 class RolloutBuffer:
-    def __init__(self, observation_dim: int, size: int, gamma: float, gae_lambda: float) -> None:
+    def __init__(
+        self,
+        observation_dim: int,
+        size: int,
+        gamma: float,
+        gae_lambda: float,
+    ) -> None:
         self.obs_buf = np.zeros((size, observation_dim), dtype=np.float32)
         self.act_buf = np.zeros(size, dtype=np.int64)
         self.adv_buf = np.zeros(size, dtype=np.float32)
@@ -164,14 +171,18 @@ class PPOAgent:
             value = self.model.value(obs_tensor)
         return int(action.item()), float(log_prob.item()), float(value.item())
 
-    def act(self, obs: np.ndarray, deterministic: bool = False) -> int:
+    def act(
+        self,
+        obs: np.ndarray,
+        deterministic: bool = False,
+    ) -> int:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            logits, _ = self.model(obs_tensor)
+            distribution = self.model.distribution(obs_tensor)
             if deterministic:
-                action = torch.argmax(logits, dim=-1)
+                action = torch.argmax(distribution.logits, dim=-1)
             else:
-                action = Categorical(logits=logits).sample()
+                action = distribution.sample()
         return int(action.item())
 
     def value(self, obs: np.ndarray) -> float:
@@ -267,6 +278,7 @@ class PPOTrainer:
         self.env = env
         self.agent = agent
         self.config = config or agent.config
+        self.completed_episodes = 0
 
     def collect_rollout(self) -> Tuple[Dict[str, "torch.Tensor"], Dict[str, float]]:
         buffer = RolloutBuffer(
@@ -280,6 +292,8 @@ class PPOTrainer:
         episode_length = 0
         completed_returns = []
         completed_lengths = []
+        successful_episode_forces = []
+        recent_gripper_forces = deque(maxlen=5)
         successes = 0
         completed_episodes = 0
 
@@ -287,6 +301,11 @@ class PPOTrainer:
             action, log_prob, value = self.agent.step(obs)
             next_obs, reward, done, info = self.env.step(action)
             buffer.store(obs, action, reward, value, log_prob)
+
+            average_gripper_force = 0.5 * (
+                float(info["left_force_n"]) + float(info["right_force_n"])
+            )
+            recent_gripper_forces.append(average_gripper_force)
 
             episode_return += reward
             episode_length += 1
@@ -298,19 +317,31 @@ class PPOTrainer:
                 last_value = 0.0 if terminal else self.agent.value(obs)
                 buffer.finish_path(last_value)
                 if done:
+                    self.completed_episodes += 1
                     completed_episodes += 1
                     completed_returns.append(episode_return)
                     completed_lengths.append(episode_length)
-                    successes += int(bool(info.get("success", False)))
+                    success = bool(info.get("success", False))
+                    successes += int(success)
+                    if success:
+                        successful_episode_forces.append(float(np.mean(recent_gripper_forces)))
+                    print(
+                        f"episode={self.completed_episodes} "
+                        f"termination_reason={info.get('reason') or 'unknown'}"
+                    )
                     obs = self.env.reset()
                     episode_return = 0.0
                     episode_length = 0
+                    recent_gripper_forces.clear()
 
         rollout_info = {
             "episodes": float(completed_episodes),
             "success_rate": float(successes / completed_episodes) if completed_episodes else 0.0,
             "mean_return": float(np.mean(completed_returns)) if completed_returns else 0.0,
             "mean_length": float(np.mean(completed_lengths)) if completed_lengths else 0.0,
+            "mean_success_gripper_force": (
+                float(np.mean(successful_episode_forces)) if successful_episode_forces else 0.0
+            ),
         }
         return buffer.get(self.config.device), rollout_info
 
@@ -322,6 +353,7 @@ class PPOTrainer:
             print(
                 "update={update} episodes={episodes:.0f} success_rate={success_rate:.3f} "
                 "mean_return={mean_return:.3f} mean_length={mean_length:.1f} "
+                "mean_success_gripper_force={mean_success_gripper_force:.3f} "
                 "kl={kl:.5f} entropy={entropy:.3f}".format(
                     update=update_idx + 1,
                     **rollout_info,
