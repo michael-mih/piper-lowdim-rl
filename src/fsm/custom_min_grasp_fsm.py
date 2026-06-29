@@ -10,6 +10,7 @@ class FSMActor:
         self.next_step_interval = 0
         self.three_force_buffer_left = [0.0,0.0,0.0]
         self.three_force_buffer_right = [0.0,0.0,0.0]
+        self.grip_delta = -0.6
         
 
 
@@ -25,16 +26,18 @@ class FSMActor:
         self.controller.send_joint_angle_cmd(c)
 
     def is_slip(self) -> bool:
-        if self.controller.get_force_left() < 0.01 and self.controller.get_force_right() < 0.01:
+        if self.controller.get_force_left() < 0.01 or self.controller.get_force_right() < 0.01:
             return True
         l = 0
         r = 0
         for i in range(0, 3):
-            if self.three_force_buffer_left[i] < 0.25:
+            if self.three_force_buffer_left[i] < 0.2:
                 l +=1
-            if self.three_force_buffer_right[i] < 0.25:
+            if self.three_force_buffer_right[i] < 0.2:
                 r +=1
             if l == 3 or r == 3:
+                pass
+            if self.three_force_buffer_left[0] - self.three_force_buffer_left[1] < self.grip_delta or self.three_force_buffer_right[0] - self.three_force_buffer_right[1] < self.grip_delta:
                 return True
         return False
     

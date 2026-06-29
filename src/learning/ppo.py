@@ -28,7 +28,7 @@ class PPOConfig:
     clip_ratio: float = 0.2
     train_iters: int = 20
     batch_size: int = 256
-    rollout_steps: int = 6000
+    rollout_steps: int = 1000
     target_kl: float = 0.01
     entropy_coef: float = 0.01
     value_coef: float = 0.5

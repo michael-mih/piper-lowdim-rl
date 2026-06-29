@@ -32,10 +32,10 @@ class PIDController:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the FSM grasp test and plot minimum force over elapsed time.")
+    parser = argparse.ArgumentParser(description="Run the FSM grasp test and plot current force over elapsed time.")
     parser.add_argument("--model-path", default=str(combined_xml), help="MuJoCo XML path.")
-    parser.add_argument("--plot-path", default="fsm_min_force_duration.png")
-    parser.add_argument("--csv-path", default="fsm_min_force_duration.csv")
+    parser.add_argument("--plot-path", default="fsm_current_force_duration.png")
+    parser.add_argument("--csv-path", default="fsm_current_force_duration.csv")
     parser.add_argument("--render", action="store_true", help="Render the FSM simulation.")
     parser.add_argument("--increment", type=float, default=0.00001)
     parser.add_argument("--convergence-interval", type=float, default=10.0)
@@ -101,8 +101,7 @@ def run_fsm(args: argparse.Namespace) -> List[Sample]:
 
     for _ in range(args.max_steps):
         fsm_actor.step()
-        if fsm_actor.min is not None:
-            samples.append((time.perf_counter() - start_time, float(fsm_actor.min)))
+        samples.append((time.perf_counter() - start_time, float(controller.get_force_average())))
 
         if fsm_actor.is_converged(args.convergence_interval):
             break
@@ -123,7 +122,7 @@ def write_csv(path: Path, samples: List[Sample]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["elapsed_s", "min_force_n"])
+        writer.writerow(["elapsed_s", "current_force_n"])
         for elapsed_s, force_n in samples:
             writer.writerow([f"{elapsed_s:.6f}", f"{force_n:.6f}"])
 
@@ -145,15 +144,15 @@ def plot_samples(path: Path, samples: List[Sample]) -> None:
 
     if samples:
         x, y = zip(*samples)
-        ax.plot(x, y, label="FSM minimum force")
+        ax.plot(x, y, label="FSM current average force")
         ax.legend()
     else:
         print("warning: FSM produced no force samples, so no force curve was plotted.")
         ax.text(0.5, 0.5, "No force samples recorded", ha="center", va="center", transform=ax.transAxes)
 
     ax.set_xlabel("Elapsed wall-clock time (s)")
-    ax.set_ylabel("Minimum average gripper force (N)")
-    ax.set_title("FSM minimum force vs program duration")
+    ax.set_ylabel("Current average gripper force (N)")
+    ax.set_title("FSM current force vs program duration")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=150)

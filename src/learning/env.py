@@ -15,12 +15,11 @@ class GraspAction(IntEnum):
     LIFT_JOINT5 = 3
     LOWER_JOINT5 = 4
 
-
 @dataclass
 class ObservationConfig:
-    min_force_threshold_n: float = 0.05
+    min_force_threshold_n: float = 0.00001
     calibration_max_steps: int = 200
-    calibration_force_mode: str = "average"
+    calibration_force_mode: str = "either"
     normalize: bool = True
     max_force_n: float = 5.0
     max_stiffness_n_per_m: float = 1000.0
@@ -34,14 +33,14 @@ class ObservationConfig:
 
 @dataclass
 class RewardConfig:
-    desired_force_min_n: float = 1.0
+    desired_force_min_n: float = 0.1
     desired_force_max_n: float = 4.0
     terminate_force_n: float = 5.0
     force_reward: float = 0.0008
     force_penalty: float = -0.0008
-    lift_reward_height_m: float = 0.0
+    lift_reward_height_m: float = 0.005
     lift_reward: float = 0.0008
-    high_lift_reward_height_m: float = 0.05
+    high_lift_reward_height_m: float = 0.015
     high_lift_reward: float = 0.0016
     success_lift_height_m: float = 0.040
     success_reward: float = 1.0
@@ -55,13 +54,14 @@ class RewardConfig:
 
 @dataclass
 class GraspEnvConfig:
-    initial_joint_angles: Tuple[float, ...] = (0, 1.5, -0.3, 0, -0.7, 0, 0.03, -0.03)
+    initial_joint_angles: Tuple[float, ...] = (0, 1.5, -0.3, 0, -0.7, 0, 0.02, -0.02) #start w open gripper and close via calibration ONLY
     max_steps: int = 250
     settle_steps: int = 5
     control_steps_per_action: int = 4
-    gripper_delta_m: float = 0.0005
+    gripper_delta_m: float = 0.0001
     joint5_lift_delta_rad: float = -0.01
     joint5_lower_delta_rad: float = 0.01
+    calibration_gripper_delta: float = 0.00001
     joint5_index: int = 4
     left_gripper_index: int = 6
     right_gripper_index: int = 7
@@ -216,13 +216,21 @@ class GraspPPOEnv:
         left_force = 0.0
         right_force = 0.0
 
-        while not self._calibration_force_met(left_force, right_force):
-            command = self._apply_action(command, GraspAction.CLOSE_GRIPPER)
-            self.controller.send_joint_angle_cmd(command)
+        while True:
+
+
             left_force = self.controller.get_force_left()
             right_force = self.controller.get_force_right()
+            if left_force != 0.0 or right_force != 0.0:
+                #print("left " + str(left_force) + " right " + str(right_force))
+                break
+   
+            command[6] -= self.env_config.calibration_gripper_delta
+            command[7] += self.env_config.calibration_gripper_delta
+            self.controller.send_joint_angle_cmd(command)
             self._run_controller_steps(1)
-
+        
+        
         reached_threshold = True
         left_force, right_force = self._read_forces()
         gap = max(self._gripper_gap(self._current_command()), self.observation_config.gripper_gap_epsilon_m)
@@ -232,6 +240,12 @@ class GraspPPOEnv:
             else max((left_force + right_force) * 0.5, 0.0)
         )
         self.stiffness_n_per_m = force_for_stiffness / gap
+
+        #
+        command[6] += self.env_config.calibration_gripper_delta
+        command[7] -= self.env_config.calibration_gripper_delta
+        self.controller.send_joint_angle_cmd(command)
+        self._run_controller_steps(1)
 
         return {
             "reached_threshold": reached_threshold,
@@ -266,8 +280,10 @@ class GraspPPOEnv:
         lift_height = self._object_lift_height()
         if lift_height is not None:
             if lift_height > cfg.lift_reward_height_m:
+                #print("lift rew")
                 reward += cfg.lift_reward
             if lift_height > cfg.high_lift_reward_height_m:
+                #print("high lift rew")
                 reward += cfg.high_lift_reward
 
         if not terminated and self._object_out_of_bounds():
@@ -291,11 +307,14 @@ class GraspPPOEnv:
                 0.0,
                 1.0,
             )
-            reward += cfg.success_reward - cfg.min_force_reward_coef * normalized_force_penalty
+            reward += cfg.success_reward #- cfg.min_force_reward_coef * normalized_force_penalty
             terminated = True
             success = True
             reason = "success"
 
+        if reason is None:
+            reason = "episode step limit exceeded"
+        
         return reward, terminated, {
             "reason": reason,
             "success": success,
@@ -318,6 +337,7 @@ class GraspPPOEnv:
         )
 
     def _calibration_force_met(self, left_force: float, right_force: float) -> bool:
+        
         threshold = self.observation_config.min_force_threshold_n
         mode = self.observation_config.calibration_force_mode
         if mode == "both":

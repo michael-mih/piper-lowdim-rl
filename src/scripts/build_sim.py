@@ -154,11 +154,25 @@ ET.SubElement(
         "type": "box",
         "size": box_half_extents,
         "rgba": "0.9 0.15 0.08 1",
-        "mass": "0.05",
+        "mass": "0.1",
         "condim": "6",
         "friction": "1 0.1 0.01",
     },
 )
+
+#ET.SubElement(
+#    body,
+#    "geom",
+#    {
+#        "name": "grasp_box_geom",
+#        "type": "box",
+#        "size": box_half_extents,
+#        "rgba": "0.9 0.15 0.08 1",
+#        "mass": "0.05",
+#        "condim": "6",
+#        "friction": "1 0.1 0.01",
+#    },
+#)
 
 # Explicit pairs prevent geom-mixing rules from silently dropping rotational
 # resistance. The five values are two sliding, one torsional, and two rolling

@@ -51,6 +51,7 @@ def main():
     controller.set_initial_position(target_angles)
     gripper_delta = 0.0001
     arm_delta = 0.001
+    inital_config = None
     while target_angles[4]>-1.2:
         controller.send_joint_angle_cmd(target_angles)
         controller.step()
@@ -59,6 +60,7 @@ def main():
             #example joint 5 movement
             #target_angles[4] = -1.2
         if gripper_delta == 0:
+
             if target_angles[4] > -1.2:
                 target_angles[4]-=arm_delta
         #example gripper movement
@@ -68,23 +70,51 @@ def main():
             break 
         
         time.sleep(0.01)
-
-    
+    inital_config = controller.get_joint_angle_cmd()
+    initial_force = controller.get_force_average()
     increment = 0.00001
-    while True:
+    iteration = 0
+    total_iterations = 4
+    converge_sum = 0
+    stop = False
+    print("iteration 1")
+    while iteration < total_iterations:
         fsmActor.step()
         if fsmActor.is_converged(10):
-            break
+            #break
+            pass
+        if not stop:
+            print("iteration " + str(iteration+1) + ", force: " + str(fsmActor.controller.get_force_average()))
         if fsmActor.is_slip():
             fsmActor.tighten(increment)
-        else:
+            val = (fsmActor.three_force_buffer_left[1] + fsmActor.three_force_buffer_right[1]) / 2
+            print("slipped at " + str(val))
+            converge_sum += val
+            stop = True 
+            controller.send_joint_angle_cmd(inital_config)
+            i = 0
+            while(i<2000):
+                controller.step()
+                i+=1
+            iteration += 1
+            
+            stop = False
+            #converge_sum += (fsmActor.three_force_buffer_left[1] + fsmActor.three_force_buffer_right[1]) / 2
+            #fsmActor.min = None
+            #while(fsmActor.controller.get_force_left() < initial_force or fsmActor.controller.get_force_right() < initial_force):
+            #    fsmActor.tighten(increment)
+            #    fsmActor.step()
+            
+            #iteration +=1
+            #fsmActor.min = None
+        elif not stop:
             fsmActor.loosen(increment)
         #print(controller.get_force_average())
         if True and glfw.window_should_close(controller.viewer.window):
             break 
         time.sleep(0.01)
 
-    print("converged at " + str(fsmActor.min))
+    print("converged at avg " + str((converge_sum / total_iterations)))
     
 if __name__ == "__main__":
     main()
