@@ -1,5 +1,4 @@
 from learning.env import (
-    GraspAction,
     GraspEnvConfig,
     GraspPPOEnv,
     ObservationConfig,
@@ -7,7 +6,6 @@ from learning.env import (
 )
 
 __all__ = [
-    "GraspAction",
     "GraspEnvConfig",
     "GraspPPOEnv",
     "ObservationConfig",

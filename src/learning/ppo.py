@@ -10,11 +10,12 @@ import numpy as np
 try:
     import torch
     from torch import nn
-    from torch.distributions import Categorical
+    from torch.distributions import Categorical, Normal
 except ImportError:  # pragma: no cover - exercised only when torch is missing.
     torch = None
     nn = None
     Categorical = None
+    Normal = None
 
 
 @dataclass
@@ -61,19 +62,24 @@ if torch is not None:
                 layers.extend([nn.Linear(last_dim, hidden_size), nn.Tanh()])
                 last_dim = hidden_size
             self.shared = nn.Sequential(*layers)
-            self.policy_head = nn.Linear(last_dim, num_actions)
+            self.mean_head = nn.Linear(last_dim, num_actions) #gripper_mean, joint5_mean
+            self.log_std_head = nn.Linear(last_dim, num_actions)
             self.value_head = nn.Linear(last_dim, 1)
 
-        def forward(self, obs: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
+        def forward(self, obs: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor"]:
             features = self.shared(obs)
-            return self.policy_head(features), self.value_head(features).squeeze(-1)
+            return self.mean_head(features), self.log_std_head(features), self.value_head(features).squeeze(-1)
 
-        def distribution(self, obs: "torch.Tensor") -> "Categorical":
-            logits, _ = self(obs)
-            return Categorical(logits=logits)
+        def distribution(self, obs: "torch.Tensor") -> "Normal":
+            mean, log_std, _ = self(obs)
+            
+            log_std = torch.clamp(log_std, -5, 2) #TODO: bounds?
+            mean = torch.clamp(mean, -1, 1)
+            std = torch.exp(log_std)
+            return Normal(mean, std)
 
         def value(self, obs: "torch.Tensor") -> "torch.Tensor":
-            _, value = self(obs)
+            _, _, value = self(obs)
             return value
 
 else:
@@ -87,12 +93,13 @@ class RolloutBuffer:
     def __init__(
         self,
         observation_dim: int,
+        num_actions: int,
         size: int,
         gamma: float,
         gae_lambda: float,
     ) -> None:
         self.obs_buf = np.zeros((size, observation_dim), dtype=np.float32)
-        self.act_buf = np.zeros(size, dtype=np.int64)
+        self.act_buf = np.zeros((size, num_actions), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.ret_buf = np.zeros(size, dtype=np.float32)
@@ -107,7 +114,7 @@ class RolloutBuffer:
     def store(
         self,
         obs: np.ndarray,
-        action: int,
+        action: np.ndarray,
         reward: float,
         value: float,
         log_prob: float,
@@ -115,7 +122,7 @@ class RolloutBuffer:
         if self.ptr >= self.max_size:
             raise RuntimeError("RolloutBuffer is full; call get() before storing more samples.")
         self.obs_buf[self.ptr] = obs
-        self.act_buf[self.ptr] = int(action)
+        self.act_buf[self.ptr] = action
         self.rew_buf[self.ptr] = float(reward)
         self.val_buf[self.ptr] = float(value)
         self.logp_buf[self.ptr] = float(log_prob)
@@ -143,7 +150,7 @@ class RolloutBuffer:
 
         return {
             "obs": torch.as_tensor(self.obs_buf, dtype=torch.float32, device=device),
-            "act": torch.as_tensor(self.act_buf, dtype=torch.int64, device=device),
+            "act": torch.as_tensor(self.act_buf, dtype=torch.float32, device=device),
             "ret": torch.as_tensor(self.ret_buf, dtype=torch.float32, device=device),
             "adv": torch.as_tensor(self.adv_buf, dtype=torch.float32, device=device),
             "logp": torch.as_tensor(self.logp_buf, dtype=torch.float32, device=device),
@@ -162,28 +169,28 @@ class PPOAgent:
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate, betas=(0.9, 0.999))
 
-    def step(self, obs: np.ndarray) -> Tuple[int, float, float]:
+    def step(self, obs: np.ndarray) -> Tuple[np.ndarray, float, float]:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             distribution = self.model.distribution(obs_tensor)
             action = distribution.sample()
-            log_prob = distribution.log_prob(action)
+            log_prob = distribution.log_prob(action).sum(-1)
             value = self.model.value(obs_tensor)
-        return int(action.item()), float(log_prob.item()), float(value.item())
+        return action.squeeze(0).cpu().numpy(), float(log_prob.item()), float(value.item())
 
     def act(
         self,
         obs: np.ndarray,
         deterministic: bool = False,
-    ) -> int:
+    ) -> np.ndarray:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             distribution = self.model.distribution(obs_tensor)
             if deterministic:
-                action = torch.argmax(distribution.logits, dim=-1)
+                action = distribution.mean
             else:
                 action = distribution.sample()
-        return int(action.item())
+        return action.squeeze(0).cpu().numpy()
 
     def value(self, obs: np.ndarray) -> float:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -210,7 +217,7 @@ class PPOAgent:
             for start in range(0, num_samples, self.config.batch_size):
                 idx = permutation[start : start + self.config.batch_size]
                 distribution = self.model.distribution(obs[idx])
-                logp = distribution.log_prob(act[idx])
+                logp = distribution.log_prob(act[idx]).sum(-1)
                 value = self.model.value(obs[idx])
                 ratio = torch.exp(logp - old_logp[idx])
 
@@ -221,7 +228,7 @@ class PPOAgent:
                 )
                 policy_loss = -torch.min(ratio * adv[idx], clipped_ratio * adv[idx]).mean()
                 value_loss = ((value - ret[idx]) ** 2).mean()
-                entropy = distribution.entropy().mean()
+                entropy = distribution.entropy().sum(-1).mean()
                 loss = policy_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy
 
                 self.optimizer.zero_grad()
@@ -283,6 +290,7 @@ class PPOTrainer:
     def collect_rollout(self) -> Tuple[Dict[str, "torch.Tensor"], Dict[str, float]]:
         buffer = RolloutBuffer(
             observation_dim=self.config.observation_dim,
+            num_actions=self.env.num_actions,
             size=self.config.rollout_steps,
             gamma=self.config.gamma,
             gae_lambda=self.config.gae_lambda,
@@ -362,3 +370,4 @@ class PPOTrainer:
             )
             if save_path is not None:
                 self.agent.save(save_path)
+

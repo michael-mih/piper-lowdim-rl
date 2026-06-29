@@ -5,7 +5,7 @@ import argparse
 import numpy as np
 
 from controllers.sim_controller import SimController
-from learning.env import GraspAction, GraspEnvConfig, GraspPPOEnv, ObservationConfig, RewardConfig
+from learning.env import GraspEnvConfig, GraspPPOEnv, ObservationConfig, RewardConfig
 from learning.ppo import PPOAgent
 from scripts.build_sim import combined_xml
 from scripts.train_ppo_grasp import PIDController
@@ -102,7 +102,7 @@ def main() -> None:
         if not done:
             print(
                 f"step={env.steps} "
-                f"action={GraspAction(action).name} reward={reward:.4f}"
+                f"action={np.asarray(action).tolist()} reward={reward:.4f}"
             )
     print(f"termination_reason={info.get('reason') or 'unknown'}")
     if not args.no_render:

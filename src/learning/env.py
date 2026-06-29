@@ -8,12 +8,6 @@ from controllers.controller import Controller
 import numpy as np
 
 
-class GraspAction(IntEnum):
-    CLOSE_GRIPPER = 0
-    HOLD_GRIPPER = 1
-    OPEN_GRIPPER = 2
-    LIFT_JOINT5 = 3
-    LOWER_JOINT5 = 4
 
 @dataclass
 class ObservationConfig:
@@ -37,7 +31,7 @@ class RewardConfig:
     desired_force_max_n: float = 4.0
     terminate_force_n: float = 5.0
     force_reward: float = 0.0008
-    force_penalty: float = -0.0008
+    force_penalty: float = -0.0025
     lift_reward_height_m: float = 0.005
     lift_reward: float = 0.0008
     high_lift_reward_height_m: float = 0.015
@@ -48,7 +42,10 @@ class RewardConfig:
     step_penalty: Optional[float] = None
     out_of_bounds_radius_m: float = 0.25
 
-    min_force_reward_coef: float = 0.5
+    min_force_reward_coef: float = 1.5
+    ideal_force_mass_ratio = 0.15 / 0.05
+    ratio_tolerance = 0.1
+
 
 
 
@@ -79,7 +76,7 @@ class GraspPPOEnv:
     reset/step interface and keeps robot-specific assumptions configurable.
     """
 
-    num_actions = len(GraspAction)
+    num_actions = 2 #continuous action vector of [gripper delta, joint5 delta]
     observation_names = (
         "left_force_n",
         "right_force_n",
@@ -149,14 +146,12 @@ class GraspPPOEnv:
         self.last_info = {"calibration": calibration_info}
         return self.observe()
 
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
         if self.done:
             return self.observe(), 0.0, True, {"already_done": True, **self.last_info}
 
-        grasp_action = GraspAction(int(action))
-        if grasp_action == GraspAction.LIFT_JOINT5:
-            self.sample_force = True
-        command = self._apply_action(self._current_command(), grasp_action)
+
+        command = self._apply_action(self._current_command(), action)
         self.controller.send_joint_angle_cmd(command)
         self._run_controller_steps(self.env_config.control_steps_per_action)
         
@@ -165,7 +160,7 @@ class GraspPPOEnv:
         truncated = self.steps >= self.env_config.max_steps and not terminated
         self.done = terminated or truncated
         info = {
-            "action": grasp_action.name,
+            "action": action,
             "terminated": terminated,
             "truncated": truncated,
             **reward_info,
@@ -264,6 +259,7 @@ class GraspPPOEnv:
 
         left_force, right_force = self._read_forces()
         reward = float(step_penalty)
+        reward += cfg.force_penalty*((left_force+right_force)/2)
         terminated = False
         reason = None
 
@@ -272,8 +268,8 @@ class GraspPPOEnv:
                 reward += cfg.failure_penalty
                 terminated = True
                 reason = f"{sensor_name}_force_limit"
-            elif cfg.desired_force_min_n <= force < cfg.desired_force_max_n:
-                reward += cfg.force_reward
+            #elif cfg.desired_force_min_n <= force < cfg.desired_force_max_n:
+            #    reward += cfg.force_reward
             elif cfg.desired_force_max_n <= force < cfg.terminate_force_n:
                 reward += cfg.force_penalty
 
@@ -307,7 +303,8 @@ class GraspPPOEnv:
                 0.0,
                 1.0,
             )
-            reward += cfg.success_reward #- cfg.min_force_reward_coef * normalized_force_penalty
+            
+            reward += cfg.success_reward - cfg.min_force_reward_coef * normalized_force_penalty
             terminated = True
             success = True
             reason = "success"
@@ -348,22 +345,16 @@ class GraspPPOEnv:
             raise ValueError("calibration_force_mode must be 'average', 'both', or 'either'")
         return 0.5 * (left_force + right_force) >= threshold
 
-    def _apply_action(self, command: Sequence[float], action: GraspAction) -> list[float]:
+    def _apply_action(self, command: Sequence[float], action: np.ndarray) -> list[float]:
         next_command = list(command)
         cfg = self.env_config
 
-        if action == GraspAction.CLOSE_GRIPPER:
-            next_command[cfg.left_gripper_index] -= cfg.gripper_delta_m
-            next_command[cfg.right_gripper_index] += cfg.gripper_delta_m
-        elif action == GraspAction.OPEN_GRIPPER:
-            next_command[cfg.left_gripper_index] += cfg.gripper_delta_m
-            next_command[cfg.right_gripper_index] -= cfg.gripper_delta_m
-        elif action == GraspAction.LIFT_JOINT5:
-            next_command[cfg.joint5_index] += cfg.joint5_lift_delta_rad
-        elif action == GraspAction.LOWER_JOINT5:
-            next_command[cfg.joint5_index] += cfg.joint5_lower_delta_rad
+        next_command[4] += action[0] * cfg.joint5_lift_delta_rad
+        next_command[6] += action[1] * cfg.gripper_delta_m
+        next_command[7] -= action[1] * cfg.gripper_delta_m #TODO: individual gripper movement?
 
         for idx in (cfg.joint5_index, cfg.left_gripper_index, cfg.right_gripper_index):
+        
             next_command[idx] = self._clamp_joint(idx, next_command[idx])
         return next_command
 
