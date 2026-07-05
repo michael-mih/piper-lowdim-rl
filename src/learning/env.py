@@ -46,6 +46,10 @@ class RewardConfig:
     ideal_force_mass_ratio = 0.15 / 0.05
     ratio_tolerance = 0.1
 
+    low_lift_angle: float = -0.80
+    high_lift_angle: float = -0.86
+    success_lift_angle: float = -0.98
+
 
 
 
@@ -59,6 +63,8 @@ class GraspEnvConfig:
     joint5_lift_delta_rad: float = -0.01
     joint5_lower_delta_rad: float = 0.01
     calibration_gripper_delta: float = 0.00001
+
+    
     joint5_index: int = 4
     left_gripper_index: int = 6
     right_gripper_index: int = 7
@@ -130,7 +136,8 @@ class GraspPPOEnv:
         self.sample_force = False
         self._sensor_offset = self._sample_offset(self.observation_config.sensor_offset_range)
         self._motor_offset = self._sample_offset(self.observation_config.motor_offset_range)
-
+        if self.env_config.initial_joint_angles is None:
+            self.env_config.initial_joint_angles = self.controller.get_joint_angles()
         self.controller.set_initial_position(list(self.env_config.initial_joint_angles))
 
 
@@ -280,8 +287,17 @@ class GraspPPOEnv:
                 reward += cfg.lift_reward
             if lift_height > cfg.high_lift_reward_height_m:
                 #print("high lift rew")
-                reward += cfg.high_lift_reward
 
+                reward += cfg.high_lift_reward
+        else:
+            af = self.controller.get_force_average()
+            current_j5_angle = self.controller.get_joint_angles()[4]
+            #neg is higher angle
+            if current_j5_angle < cfg.low_lift_angle and af> cfg.desired_force_min_n :
+                reward += cfg.lift_reward
+                print("hit")
+            if current_j5_angle < cfg.high_lift_angle and af > cfg.desired_force_min_n:
+                reward += cfg.high_lift_reward
         if not terminated and self._object_out_of_bounds():
             reward += cfg.failure_penalty
             terminated = True
@@ -292,6 +308,7 @@ class GraspPPOEnv:
             self.episode_force_samples += 1
         success = False
         if not terminated and self._is_success(left_force, right_force, lift_height):
+            print("joint 5 success angle: " + str(self.controller.get_joint_angles()[4]))
             average_force = (
                 self.episode_force_sum / self.episode_force_samples
                 if self.episode_force_samples
@@ -323,9 +340,13 @@ class GraspPPOEnv:
 
     def _is_success(self, left_force: float, right_force: float, lift_height: Optional[float]) -> bool:
         cfg = self.reward_config
-        if lift_height is None:
-            return False
         average_force = 0.5 * (left_force + right_force)
+        if lift_height is None:
+            return (self.controller.get_joint_angles()[4] < cfg.success_lift_angle
+                     and average_force > cfg.desired_force_min_n 
+                     and left_force < cfg.desired_force_max_n 
+                     and right_force < cfg.desired_force_max_n)
+
         return (
             lift_height > cfg.success_lift_height_m
             and average_force >= cfg.desired_force_min_n

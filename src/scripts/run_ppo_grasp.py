@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 
 from controllers.sim_controller import SimController
+from controllers.phys_controller import PhysController
 from learning.env import GraspEnvConfig, GraspPPOEnv, ObservationConfig, RewardConfig
 from learning.ppo import PPOAgent
 from scripts.build_sim import combined_xml
@@ -34,6 +35,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Sample from the policy instead of selecting its highest-probability action.",
     )
+    parser.add_argument(
+        "--controller",
+        default="sim"
+    )
     return parser.parse_args()
 
 
@@ -52,12 +57,18 @@ def main() -> None:
                 f"Requested PyTorch device {device!r}, but CUDA is not available."
             )
 
-    controller = SimController(
-        pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)],
-        model_path=args.model_path,
-        render=not args.no_render,
-    )
+    c = args.controller 
+    if c == "sim":
+        controller = SimController(
+            pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)],
+            model_path=args.model_path,
+            render=not args.no_render,
+        )
 
+    else:
+        controller = PhysController(
+            pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)]
+        )
     env_config_kwargs = {}
     if args.max_steps is not None:
         env_config_kwargs["max_steps"] = args.max_steps
@@ -68,6 +79,7 @@ def main() -> None:
 
     env = GraspPPOEnv(
         controller=controller,
+        object_height_fn= lambda controller: None,
         env_config=GraspEnvConfig(**env_config_kwargs),
         observation_config=ObservationConfig(**observation_config_kwargs),
         reward_config=RewardConfig(),

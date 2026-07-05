@@ -7,11 +7,6 @@ class Controller(ABC):
         self.pid_controllers = pid_controllers
         self.joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "joint8"]  # 假设机械臂有6个关节 + gripper
 
-    @abstractmethod #reset the non controllable components: 
-    #TODO: irl when collecting for offline policy this is probably just a wait until confirmed human intervention? unsure. 
-    def _restore_passive_joint_state(self) -> None:
-        pass
-
     @abstractmethod
     def send_joint_angle_cmd(self, cmds: list[float]) -> None:
         pass

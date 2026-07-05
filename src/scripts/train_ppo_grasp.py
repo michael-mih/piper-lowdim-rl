@@ -712,6 +712,7 @@ def main() -> None:
         )
         env = GraspPPOEnv(
             controller=controller,
+            object_height_fn=lambda controller: None,
             env_config=GraspEnvConfig(**env_config_kwargs),
             observation_config=ObservationConfig(**observation_config_kwargs),
             reward_config=RewardConfig(),
