@@ -2,8 +2,8 @@ from controllers.controller import Controller
 from pyAgxArm import create_agx_arm_config, AgxArmFactory, ArmModel, PiperFW
 import time
 class PhysController(Controller):
-    def __init__(self, pid_controllers, channel: str = "can0", speed_percent: int = 50):
-        super().__init__(pid_controllers)
+    def __init__(self, pid_controllers, ground_truth_pos: bool = False, channel: str = "can0", speed_percent: int = 50):
+        super().__init__(pid_controllers, ground_truth_pos)
         #TODO ???
         self.joint_bounds = [-2.618, 2.168, 0, 3.14, -2.967, 0, -1.745, 1.745, -1.22, 1.22, -2.0944, 2.0944, 0, 0.07]
 

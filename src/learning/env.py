@@ -146,9 +146,10 @@ class GraspPPOEnv:
         
         calibration_info = self._calibrate_stiffness()
 
-        self._initial_object_height = self._read_object_height()
-        pos = self._read_object_position()
-        self._initial_object_xy = None if pos is None else np.asarray(pos[:2], dtype=np.float32)
+        self._initial_object_height = self._obj_height()
+        pos = self._obj_height()
+        self._initial_object_xy = None if pos is None else np.asarray(self.controller.sim.data.get_body_xpos(self.env_config.default_body_name), dtype=np.float32)[:2]
+        
 
         self.last_info = {"calibration": calibration_info}
         return self.observe()
@@ -279,35 +280,14 @@ class GraspPPOEnv:
             #    reward += cfg.force_reward
             elif cfg.desired_force_max_n <= force < cfg.terminate_force_n:
                 reward += cfg.force_penalty
-
-        lift_height = self._object_lift_height()
-        if lift_height is not None:
-            if lift_height > cfg.lift_reward_height_m:
-                #print("lift rew")
-                reward += cfg.lift_reward
-            if lift_height > cfg.high_lift_reward_height_m:
-                #print("high lift rew")
-
-                reward += cfg.high_lift_reward
-        else:
-            af = self.controller.get_force_average()
-            current_j5_angle = self.controller.get_joint_angles()[4]
-            #neg is higher angle
-            if current_j5_angle < cfg.low_lift_angle and af> cfg.desired_force_min_n :
-                reward += cfg.lift_reward
-                print("hit")
-            if current_j5_angle < cfg.high_lift_angle and af > cfg.desired_force_min_n:
-                reward += cfg.high_lift_reward
-        if not terminated and self._object_out_of_bounds():
-            reward += cfg.failure_penalty
-            terminated = True
-            reason = "object_out_of_bounds"
+        
+        reward += self._compute_height_reward(cfg)
 
         if self.sample_force:
             self.episode_force_sum += 0.5 * (left_force + right_force)
             self.episode_force_samples += 1
         success = False
-        if not terminated and self._is_success(left_force, right_force, lift_height):
+        if not terminated and self._is_success(left_force, right_force):
             print("joint 5 success angle: " + str(self.controller.get_joint_angles()[4]))
             average_force = (
                 self.episode_force_sum / self.episode_force_samples
@@ -334,25 +314,50 @@ class GraspPPOEnv:
             "success": success,
             "left_force_n": left_force,
             "right_force_n": right_force,
-            "object_lift_height_m": lift_height,
+            "object_lift_height_m": None,
             "stiffness_n_per_m": self.stiffness_n_per_m,
         }
 
-    def _is_success(self, left_force: float, right_force: float, lift_height: Optional[float]) -> bool:
+    def _is_success(self, left_force: float, right_force: float) -> bool:
         cfg = self.reward_config
         average_force = 0.5 * (left_force + right_force)
-        if lift_height is None:
+        if self.controller.ground_truth_pos is False:
             return (self.controller.get_joint_angles()[4] < cfg.success_lift_angle
                      and average_force > cfg.desired_force_min_n 
                      and left_force < cfg.desired_force_max_n 
                      and right_force < cfg.desired_force_max_n)
 
         return (
-            lift_height > cfg.success_lift_height_m
+            self._obj_height() - self._initial_object_height > cfg.success_lift_height_m
             and average_force >= cfg.desired_force_min_n
             and left_force < cfg.desired_force_max_n
             and right_force < cfg.desired_force_max_n
         )
+
+    def _compute_height_reward(self, cfg: RewardConfig) -> float:
+        rew = 0
+        if self.controller.ground_truth_pos == True:
+            current_height = self.controller.sim.data.get_body_xpos(self.env_config.default_body_name)[2]
+            delta_height = current_height - self._initial_object_height
+            if delta_height > cfg.lift_reward_height_m:
+                print("lift rew")
+                rew += cfg.lift_reward
+            if delta_height > cfg.high_lift_reward_height_m:
+                print("high lift rew")
+
+                rew += cfg.high_lift_reward
+            return rew
+        af = self.controller.get_force_average()
+        current_j5_angle = self.controller.get_joint_angles()[4]
+        #neg is higher angle
+        if current_j5_angle < cfg.low_lift_angle and af> cfg.desired_force_min_n :
+            rew += cfg.lift_reward  
+            print("lift rew")
+        if current_j5_angle < cfg.high_lift_angle and af > cfg.desired_force_min_n:
+            rew += cfg.high_lift_reward
+            print("high lift rew")
+        return rew
+
 
     def _calibration_force_met(self, left_force: float, right_force: float) -> bool:
         
@@ -414,36 +419,15 @@ class GraspPPOEnv:
             float(self.controller.get_force_right()),
         )
 
-    def _read_object_height(self) -> Optional[float]:
-        if self.object_height_fn is not None:
-            height = self.object_height_fn(self.controller)
-            return None if height is None else float(height)
-        pos = self._default_body_position()
-        return None if pos is None else float(pos[2])
-
-    def _read_object_position(self) -> Optional[np.ndarray]:
-        if self.object_position_fn is not None:
-            pos = self.object_position_fn(self.controller)
-            return None if pos is None else np.asarray(pos, dtype=np.float32)
-        return self._default_body_position()
-
-    def _default_body_position(self) -> Optional[np.ndarray]:
-        sim = getattr(self.controller, "sim", None)
-        if sim is None:
-            return None
-        try:
-            return np.asarray(sim.data.get_body_xpos(self.env_config.default_body_name), dtype=np.float32)
-        except Exception:
-            return None
-
-    def _object_lift_height(self) -> Optional[float]:
-        current_height = self._read_object_height()
-        if current_height is None or self._initial_object_height is None:
-            return None
-        return float(current_height - self._initial_object_height)
+    def _obj_height(self) -> float:
+        if self.controller.ground_truth_pos == True:
+            return self.controller.sim.data.get_body_xpos(self.env_config.default_body_name)[2]
+        return None
+    
+  
 
     def _object_out_of_bounds(self) -> bool:
-        current_pos = self._read_object_position()
+        current_pos = self._obj_height()
         if current_pos is None or self._initial_object_xy is None:
             return False
         distance = np.linalg.norm(np.asarray(current_pos[:2], dtype=np.float32) - self._initial_object_xy)

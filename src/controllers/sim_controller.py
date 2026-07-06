@@ -5,10 +5,10 @@ import time
 import glfw  # 用于检查窗口关闭事件
 
 class SimController(Controller):
-    def __init__(self, pid_controllers, model_path, render=True):
+    def __init__(self, pid_controllers, model_path, ground_truth_pos: bool = False, render=True):
         from mujoco_py import load_model_from_path, MjSim
 
-        super().__init__(pid_controllers=pid_controllers)
+        super().__init__(pid_controllers=pid_controllers, ground_truth_pos=ground_truth_pos)
         model = load_model_from_path(model_path)
         self.sim = MjSim(model)
         self.viewer = None
@@ -23,6 +23,10 @@ class SimController(Controller):
         self.drop_termination_height_m = 0.025
         self.drop_termination_offset_m = 1.0
         self.object_dropped = False
+
+       
+
+
 
     def _capture_passive_joint_state(self):
         passive_joint_state = []

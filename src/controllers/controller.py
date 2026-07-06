@@ -3,10 +3,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 class Controller(ABC):
-    def __init__(self, pid_controllers):
+    def __init__(self, pid_controllers, ground_truth_pos):
         self.pid_controllers = pid_controllers
         self.joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "joint8"]  # 假设机械臂有6个关节 + gripper
-
+        self.ground_truth_pos = ground_truth_pos
     @abstractmethod
     def send_joint_angle_cmd(self, cmds: list[float]) -> None:
         pass
