@@ -12,7 +12,7 @@ import numpy as np
 @dataclass
 class ObservationConfig:
     min_force_threshold_n: float = 0.00001
-    calibration_max_steps: int = 200
+    calibration_max_steps: int = 200000
     calibration_force_mode: str = "either"
     normalize: bool = True
     max_force_n: float = 5.0
@@ -23,6 +23,9 @@ class ObservationConfig:
     sensor_noise_std: float = 0.0
     motor_offset_range: float = 0.0
 
+## GPR force estimate -> model returns desired delta
+## GPR force estimate -> model returns desired delta fed into PID 
+## GPR Force estimate -> model learns desired delta as well as PID coefficients?
 
 
 @dataclass
@@ -46,10 +49,13 @@ class RewardConfig:
     ideal_force_mass_ratio = 0.15 / 0.05
     ratio_tolerance = 0.1
 
+    #low_lift_angle: float = -0.80
+    #high_lift_angle: float = -0.86
+    #success_lift_angle: float = -0.98
+
     low_lift_angle: float = -0.80
     high_lift_angle: float = -0.86
-    success_lift_angle: float = -0.98
-
+    success_lift_angle: float = -1.08
 
 
 
@@ -139,10 +145,7 @@ class GraspPPOEnv:
         if self.env_config.initial_joint_angles is None:
             self.env_config.initial_joint_angles = self.controller.get_joint_angles()
         self.controller.set_initial_position(list(self.env_config.initial_joint_angles))
-
-
-        #self._run_controller_steps(self.env_config.settle_steps)
-        
+        self._run_controller_steps(self.env_config.settle_steps)
         
         calibration_info = self._calibrate_stiffness()
 
@@ -218,23 +221,37 @@ class GraspPPOEnv:
         reached_threshold = False
         left_force = 0.0
         right_force = 0.0
+        calibration_steps = 0
+        cfg = self.env_config
 
-        while True:
-
-
-            left_force = self.controller.get_force_left()
-            right_force = self.controller.get_force_right()
-            if left_force != 0.0 or right_force != 0.0:
-                #print("left " + str(left_force) + " right " + str(right_force))
+        for calibration_steps in range(
+            self.observation_config.calibration_max_steps + 1
+        ):
+            left_force, right_force = self._read_forces()
+            if self._calibration_force_met(left_force, right_force):
+                reached_threshold = True
                 break
-   
-            command[6] -= self.env_config.calibration_gripper_delta
-            command[7] += self.env_config.calibration_gripper_delta
+            if calibration_steps >= self.observation_config.calibration_max_steps:
+                raise RuntimeError("Max calibration steps reached")
+
+            previous_gap = self._gripper_gap(command)
+            command[cfg.left_gripper_index] -= cfg.calibration_gripper_delta
+            command[cfg.right_gripper_index] += cfg.calibration_gripper_delta
+            command[cfg.left_gripper_index] = self._clamp_joint(
+                cfg.left_gripper_index,
+                command[cfg.left_gripper_index],
+            )
+            command[cfg.right_gripper_index] = self._clamp_joint(
+                cfg.right_gripper_index,
+                command[cfg.right_gripper_index],
+            )
             self.controller.send_joint_angle_cmd(command)
             self._run_controller_steps(1)
-        
-        
-        reached_threshold = True
+
+            command = self._current_command()
+            if self._gripper_gap(command) >= previous_gap:
+                break
+
         left_force, right_force = self._read_forces()
         gap = max(self._gripper_gap(self._current_command()), self.observation_config.gripper_gap_epsilon_m)
         force_for_stiffness = (
@@ -244,15 +261,15 @@ class GraspPPOEnv:
         )
         self.stiffness_n_per_m = force_for_stiffness / gap
 
-        #
-        command[6] += self.env_config.calibration_gripper_delta
-        command[7] -= self.env_config.calibration_gripper_delta
-        self.controller.send_joint_angle_cmd(command)
-        self._run_controller_steps(1)
+        if reached_threshold:
+            command[cfg.left_gripper_index] += cfg.calibration_gripper_delta
+            command[cfg.right_gripper_index] -= cfg.calibration_gripper_delta
+            self.controller.send_joint_angle_cmd(command)
+            self._run_controller_steps(1)
 
         return {
             "reached_threshold": reached_threshold,
-            "steps": 0,
+            "steps": calibration_steps,
             "left_force_n": left_force,
             "right_force_n": right_force,
             "gripper_gap_m": gap,

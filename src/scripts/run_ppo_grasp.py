@@ -13,7 +13,9 @@ from scripts.train_ppo_grasp import PIDController
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a trained PPO gripper policy in MuJoCo.")
+    parser = argparse.ArgumentParser(
+        description="Run a trained PPO gripper policy in simulation or on Piper."
+    )
     parser.add_argument("checkpoint", help="Checkpoint produced by train-ppo-grasp.")
     parser.add_argument("--model-path", default=str(combined_xml), help="MuJoCo XML path.")
 
@@ -37,8 +39,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--controller",
-        default="sim"
+        choices=("sim", "phys"),
+        default="sim",
     )
+    parser.add_argument("--can-channel", default="can0")
+    parser.add_argument("--speed-percent", type=int, default=50)
     return parser.parse_args()
 
 
@@ -57,18 +62,6 @@ def main() -> None:
                 f"Requested PyTorch device {device!r}, but CUDA is not available."
             )
 
-    c = args.controller 
-    if c == "sim":
-        controller = SimController(
-            pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)],
-            model_path=args.model_path,
-            render=not args.no_render,
-        )
-
-    else:
-        controller = PhysController(
-            pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)]
-        )
     env_config_kwargs = {}
     if args.max_steps is not None:
         env_config_kwargs["max_steps"] = args.max_steps
@@ -77,54 +70,79 @@ def main() -> None:
     if args.min_force is not None:
         observation_config_kwargs["min_force_threshold_n"] = args.min_force
 
-    env = GraspPPOEnv(
-        controller=controller,
-        object_height_fn= lambda controller: None,
-        env_config=GraspEnvConfig(**env_config_kwargs),
-        observation_config=ObservationConfig(**observation_config_kwargs),
-        reward_config=RewardConfig(),
-        seed=args.seed,
-    )
     agent = PPOAgent.load(args.checkpoint, device=device)
     agent.model.eval()
 
-    if agent.config.observation_dim != env.observation_dim:
+    expected_observation_dim = len(GraspPPOEnv.observation_names)
+    if agent.config.observation_dim != expected_observation_dim:
         raise ValueError(
             f"Checkpoint expects {agent.config.observation_dim} observations, "
-            f"but the environment provides {env.observation_dim}."
+            f"but the environment provides {expected_observation_dim}."
         )
-    if agent.config.num_actions != env.num_actions:
+    if agent.config.num_actions != GraspPPOEnv.num_actions:
         raise ValueError(
             f"Checkpoint expects {agent.config.num_actions} actions, "
-            f"but the environment provides {env.num_actions}."
+            f"but the environment provides {GraspPPOEnv.num_actions}."
         )
 
-
-
-    observation = env.reset()
-    done = False
-    info = {}
-
-    while not done:
-        action = agent.act(
-            observation,
-            deterministic=not args.stochastic,
-        )
-        observation, reward, done, info = env.step(action)
-        if not done:
-            print(
-                f"step={env.steps} "
-                f"action={np.asarray(action).tolist()} reward={reward:.4f}"
+    controller = None
+    try:
+        if args.controller == "sim":
+            controller = SimController(
+                pid_controllers=[
+                    PIDController(0.01, 0.0, 0.0) for _ in range(8)
+                ],
+                model_path=args.model_path,
+                render=not args.no_render,
             )
-    print(f"termination_reason={info.get('reason') or 'unknown'}")
-    if not args.no_render:
-        while True:
-            env.controller.step()
+        else:
+            controller = PhysController(
+                pid_controllers=[
+                    PIDController(0.01, 0.0, 0.0) for _ in range(8)
+                ],
+                channel=args.can_channel,
+                speed_percent=args.speed_percent,
+            )
 
+        env = GraspPPOEnv(
+            controller=controller,
+            object_height_fn=lambda controller: None,
+            env_config=GraspEnvConfig(**env_config_kwargs),
+            observation_config=ObservationConfig(**observation_config_kwargs),
+            reward_config=RewardConfig(),
+            seed=args.seed,
+        )
 
-    
+        observation = env.reset()
+        calibration = env.last_info.get("calibration", {})
+        if args.controller == "phys" and not calibration.get(
+            "reached_threshold", False
+        ):
+            raise RuntimeError(
+                "Physical grasp calibration ended without reaching the force threshold"
+            )
 
-    
+        done = False
+        info = {}
+        while not done:
+            action = agent.act(
+                observation,
+                deterministic=not args.stochastic,
+            )
+            observation, reward, done, info = env.step(action)
+            if not done:
+                print(
+                    f"step={env.steps} "
+                    f"action={np.asarray(action).tolist()} reward={reward:.4f}"
+                )
+        print(f"termination_reason={info.get('reason') or 'unknown'}")
+
+        if args.controller == "sim" and not args.no_render:
+            while True:
+                env.controller.step()
+    finally:
+        if controller is not None and hasattr(controller, "stop"):
+            controller.stop()
 
 
 if __name__ == "__main__":
