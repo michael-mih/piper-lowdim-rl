@@ -61,7 +61,7 @@ class RewardConfig:
 
 @dataclass
 class GraspEnvConfig:
-    initial_joint_angles: Tuple[float, ...] = (0, 1.5, -0.3, 0, -0.7, 0, 0.02, -0.02) #start w open gripper and close via calibration ONLY
+    initial_joint_angles: Tuple[float, ...] = (0, 1.5, -0.3, 0, -0.7, 0, 0.04) #start w open gripper and close via calibration ONLY
     max_steps: int = 250
     settle_steps: int = 5
     control_steps_per_action: int = 4
@@ -72,8 +72,7 @@ class GraspEnvConfig:
 
     
     joint5_index: int = 4
-    left_gripper_index: int = 6
-    right_gripper_index: int = 7
+    gripper_index: int = 6
     default_body_name: str = "grasp_box"
 
 
@@ -235,15 +234,10 @@ class GraspPPOEnv:
                 raise RuntimeError("Max calibration steps reached")
 
             previous_gap = self._gripper_gap(command)
-            command[cfg.left_gripper_index] -= cfg.calibration_gripper_delta
-            command[cfg.right_gripper_index] += cfg.calibration_gripper_delta
-            command[cfg.left_gripper_index] = self._clamp_joint(
-                cfg.left_gripper_index,
-                command[cfg.left_gripper_index],
-            )
-            command[cfg.right_gripper_index] = self._clamp_joint(
-                cfg.right_gripper_index,
-                command[cfg.right_gripper_index],
+            command[cfg.gripper_index] -= cfg.calibration_gripper_delta
+            command[cfg.gripper_index] = self._clamp_joint(
+                cfg.gripper_index,
+                command[cfg.gripper_index],
             )
             self.controller.send_joint_angle_cmd(command)
             self._run_controller_steps(1)
@@ -262,8 +256,7 @@ class GraspPPOEnv:
         self.stiffness_n_per_m = force_for_stiffness / gap
 
         if reached_threshold:
-            command[cfg.left_gripper_index] += cfg.calibration_gripper_delta
-            command[cfg.right_gripper_index] -= cfg.calibration_gripper_delta
+            command[cfg.gripper_index] += cfg.calibration_gripper_delta
             self.controller.send_joint_angle_cmd(command)
             self._run_controller_steps(1)
 
@@ -392,11 +385,10 @@ class GraspPPOEnv:
         next_command = list(command)
         cfg = self.env_config
 
-        next_command[4] += action[0] * cfg.joint5_lift_delta_rad
-        next_command[6] += action[1] * cfg.gripper_delta_m
-        next_command[7] -= action[1] * cfg.gripper_delta_m #TODO: individual gripper movement?
+        next_command[cfg.joint5_index] += action[0] * cfg.joint5_lift_delta_rad
+        next_command[cfg.gripper_index] += action[1] * cfg.gripper_delta_m
 
-        for idx in (cfg.joint5_index, cfg.left_gripper_index, cfg.right_gripper_index):
+        for idx in (cfg.joint5_index, cfg.gripper_index):
         
             next_command[idx] = self._clamp_joint(idx, next_command[idx])
         return next_command
@@ -416,19 +408,14 @@ class GraspPPOEnv:
             lo = float(bounds[joint_index * 2])
             hi = float(bounds[joint_index * 2 + 1])
             return max(lo, min(float(value), hi))
-        if joint_index == self.env_config.left_gripper_index:
-            return max(0.0, min(float(value), 0.035))
-        if joint_index == self.env_config.right_gripper_index:
-            return max(-0.035, min(float(value), 0.0))
+        if joint_index == self.env_config.gripper_index:
+            return max(0.0, min(float(value), self.observation_config.max_gripper_gap_m))
         if joint_index == self.env_config.joint5_index:
             return max(-1.22, min(float(value), 1.22))
         return float(value)
 
     def _gripper_gap(self, command: Sequence[float]) -> float:
-        return abs(
-            float(command[self.env_config.left_gripper_index])
-            - float(command[self.env_config.right_gripper_index])
-        )
+        return abs(float(command[self.env_config.gripper_index]))
 
     def _read_forces(self) -> Tuple[float, float]:
         return max(0.0, float(self.controller.get_force_left())), max(

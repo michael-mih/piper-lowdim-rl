@@ -16,7 +16,7 @@ class SimController(Controller):
             from mujoco_py import MjViewer
 
             self.viewer = MjViewer(self.sim)
-        self.joint_bounds = [-2.618, 2.168, 0, 3.14, -2.967, 0, -1.745, 1.745, -1.22, 1.22, -2.0944, 2.0944, 0, 0.035, -0.035, 0]
+        self.joint_bounds = [-2.618, 2.168, 0, 3.14, -2.967, 0, -1.745, 1.745, -1.22, 1.22, -2.0944, 2.0944, 0, 0.07]
         self.target_angles = self.get_joint_angles()
         
         self._passive_joint_state = self._capture_passive_joint_state()
@@ -84,6 +84,9 @@ class SimController(Controller):
             return
 
     def send_joint_angle_cmd(self, cmds):
+        if len(cmds) != 7:
+            raise ValueError("Expected 7 command values (6 arm joints and 1 gripper).")
+
         clamped_cmds = []
         for i in range(0, len(cmds)): #clamping
             clamped_cmds.append(max(self.joint_bounds[i*2], min(cmds[i], self.joint_bounds[i*2+1])))
@@ -95,32 +98,40 @@ class SimController(Controller):
     
     def get_joint_angles(self):
         current_angles = []
-        for joint_name in self.joint_names:
+        for joint_name in self.joint_names[:6]:
             joint_id = self.sim.model.joint_name2id(joint_name)
             qpos_addr = self.sim.model.jnt_qposadr[joint_id]
             current_angles.append(self.sim.data.qpos[qpos_addr])  # 获取每个关节的当前角度
-        return current_angles
+        gripper_joint_id = self.sim.model.joint_name2id(self.joint_names[6])
+        gripper_qpos_addr = self.sim.model.jnt_qposadr[gripper_joint_id]
+        return current_angles + [2.0 * self.sim.data.qpos[gripper_qpos_addr]]
 
     def set_initial_position(self, initial_pos):
         self.send_joint_angle_cmd(initial_pos)
         self.object_dropped = False
         self._restore_passive_joint_state()
+        actual_targets = self._actual_joint_targets()
         for i in range(len(self.joint_names)):
             joint_id = self.sim.model.joint_name2id(self.joint_names[i])
             qpos_addr = self.sim.model.jnt_qposadr[joint_id]
-            self.sim.data.qpos[qpos_addr] = self.target_angles[i]
-            self.sim.data.ctrl[i] = self.target_angles[i]
+            self.sim.data.qpos[qpos_addr] = actual_targets[i]
+            self.sim.data.ctrl[i] = actual_targets[i]
 
         self.sim.data.qvel[:] = 0
         self.sim.forward()
 
     def step(self):
+        actual_targets = self._actual_joint_targets()
         for i in range(len(self.joint_names)):
-            self.sim.data.ctrl[i] = self.target_angles[i]
+            self.sim.data.ctrl[i] = actual_targets[i]
         self.sim.step()
         self._mark_dropped_passive_objects()
         if self.viewer is not None:
             self.viewer.render()
+
+    def _actual_joint_targets(self):
+        gripper = self.target_angles[6] / 2.0
+        return self.target_angles[:6] + [gripper, -gripper]
 
     def get_sensor_value(self, sensor_name):
         sensor_id = self.sim.model.sensor_name2id(sensor_name)

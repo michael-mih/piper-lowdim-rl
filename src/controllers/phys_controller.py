@@ -266,16 +266,15 @@ class PhysController(Controller):
 
     def get_joint_angles(self) -> list[float]:
         positions = list(self.ros.current_positions)
-        gripper = positions[6]
-        return positions[:6] + [gripper, -gripper]
+        return positions[:6] + [self.ros.gripper_pos]
 
     def send_joint_angle_cmd(self, cmds: Sequence[float]) -> None:
-        if len(cmds) < 7:
-            raise ValueError("Expected at least 7 command values.")
+        if len(cmds) != 7:
+            raise ValueError("Expected 7 command values (6 arm joints and 1 gripper).")
 
         gripper = cmds[6]
         self.target_angles = self.get_joint_angles()
-        self.target_angles[6:8] = [gripper, -gripper]
+        self.target_angles[6] = gripper
         self.angle = gripper
         self.angle_cmd = gripper
         self.ros.current_positions[6] = gripper
@@ -287,6 +286,9 @@ class PhysController(Controller):
         self.ros.joint_pub.publish(self.ros.cmd_msg)
 
     def set_initial_position(self, initial_pos: Sequence[float]) -> None:
+        if len(initial_pos) != 7:
+            raise ValueError("Expected 7 initial position values (6 arm joints and 1 gripper).")
+
         self.target_angles = self.get_joint_angles()
         self.angle = self.ros.current_positions[6]
         self.angle_cmd = self.angle
@@ -364,7 +366,7 @@ class PhysController(Controller):
         # Update running derivative tracking state
         self.F_error_prev = F_error
         #self.ros.current_positions[6] = self.angle
-        #self.target_angles[6:8] = [self.angle, -self.angle]
+        #self.target_angles[6] = self.angle
         
         # Build and send message out to the CAN 
         #self.ros.cmd_msg.header.stamp = rospy.Time.now()
