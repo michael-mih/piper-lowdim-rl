@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 from controllers.controller import Controller
 
 import numpy as np
+import math
 
 
 
@@ -360,12 +361,11 @@ class GraspPPOEnv:
         af = self.controller.get_force_average()
         current_j5_angle = self.controller.get_joint_angles()[4]
         #neg is higher angle
-        if current_j5_angle < cfg.low_lift_angle and af> cfg.desired_force_min_n :
-            rew += cfg.lift_reward  
-            print("lift rew")
-        if current_j5_angle < cfg.high_lift_angle and af > cfg.desired_force_min_n:
-            rew += cfg.high_lift_reward
-            print("high lift rew")
+        if af > cfg.desired_force_min_n:
+            y = self.f(current_j5_angle)
+            rew+= y
+            print(y)
+
         return rew
 
 
@@ -462,3 +462,13 @@ class GraspPPOEnv:
 
     def _clamp(value, min_val, max_val):
         return max(min_val, min(value, max_val))
+
+    
+
+    A = 2.2e-6
+    B = 3e-3
+    X_ZERO = 6.6 - math.log(B / A)
+
+    def f(self, x: float) -> float:
+        return self.B * math.expm1(self.X_ZERO - x)
+        

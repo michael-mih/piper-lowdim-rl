@@ -123,14 +123,8 @@ class PhysController(Controller):
 
         def JointState_Cb(self, msg):
             if len(msg.position) >= 7:
-                self.current_positions[0:6] = msg.position[0:6]
+                self.current_positions[0:7] = msg.position[0:7]
                 
-            try:
-                idx = msg.name.index("gripper")
-                self.gripper_pos = msg.position[idx]
-                self.gripper_eff = msg.effort[idx]
-            except ValueError:
-                pass
 
         
 
@@ -140,8 +134,6 @@ class PhysController(Controller):
             self.fsr1 = 4095.0
             self.fsr2 = 4095.0
             self.loadcell = 0.0
-            self.gripper_pos = 0.0
-            self.gripper_eff = 0.0
             self.current_positions = [0.0] * 7
 
             # ROS Subscribers
@@ -233,15 +225,13 @@ class PhysController(Controller):
             rospy.loginfo("GPR Model loaded successfully.")
         except Exception as e:
             rospy.logerr(f"Failed to load model: {e}")
-            exit()
+            self.stop()
 
         self.N = 5
         self.fsr_buffer1 = deque(maxlen=self.N)
         self.fsr_buffer2 = deque(maxlen=self.N)
 
         self.F_error_Int = 0.0
-        self.angle = self.ros.gripper_pos
-        self.angle_cmd = self.ros.gripper_pos
         self.F_error_prev = 0.0      
         self.d_error_filtered = 0.0  
         self.alpha = 0.25
@@ -249,59 +239,49 @@ class PhysController(Controller):
         self.y_pred2_val = 0.0
         self.target_angles = self.get_joint_angles()
 
-        File_name = time.strftime('%Y_%m_%d_%H_%M_%S')
-        os.makedirs('./Data', exist_ok=True)
-        self.file = open('./Data/Exp_' + File_name + '.txt', 'w')
 
 
       
     def stop(self) -> None:
         self.ros.stop()
-        self.file.close()
-        rospy.loginfo("Done. File saved.")
-        
+
 
     def get_joint_angle_cmd(self) -> list[float]:
         return list(self.target_angles)
 
     def get_joint_angles(self) -> list[float]:
-        positions = list(self.ros.current_positions)
-        return positions[:6] + [self.ros.gripper_pos]
+        return list(self.ros.current_positions)
 
     def send_joint_angle_cmd(self, cmds: Sequence[float]) -> None:
         if len(cmds) != 7:
             raise ValueError("Expected 7 command values (6 arm joints and 1 gripper).")
 
-        gripper = cmds[6]
-        self.target_angles = self.get_joint_angles()
-        self.target_angles[6] = gripper
-        self.angle = gripper
-        self.angle_cmd = gripper
-        self.ros.current_positions[6] = gripper
+        #clamped_cmds = []
+        #for i in range(0, len(cmds)): #clamping
+        #    clamped_cmds.append(max(self.joint_bounds[i*2], min(cmds[i], self.joint_bounds[i*2+1])))
+        
+        cmds[4] = self._clamp(cmds[4], 0, 0) #TODO
+        cmds[6] = self._clamp(cmds[6], 0.0, 0.07)
+        self.target_angles = list(cmds)
 
         self.ros.cmd_msg.header.stamp = rospy.Time.now()
-        self.ros.cmd_msg.position = self.ros.current_positions
+        self.ros.cmd_msg.position = cmds
         self.ros.cmd_msg.effort[6] = 1
         self.ros.cmd_msg.velocity[6] = 0.0
         self.ros.joint_pub.publish(self.ros.cmd_msg)
 
-    def set_initial_position(self, initial_pos: Sequence[float]) -> None:
-        if len(initial_pos) != 7:
-            raise ValueError("Expected 7 initial position values (6 arm joints and 1 gripper).")
+    def set_initial_position(self, initial_pos: Sequence[float] = None) -> None:
+        
+        if initial_pos is not None:  
+            self.target_angles = initial_pos
+        else:
+            self.target_angles = self.get_joint_angles()
 
-        self.target_angles = self.get_joint_angles()
-        self.angle = self.ros.current_positions[6]
-        self.angle_cmd = self.angle
+        self.send_joint_angle_cmd(self.target_angles)
 
-        self.ros.cmd_msg.header.stamp = rospy.Time.now()
-        self.ros.cmd_msg.position = self.ros.current_positions
-        self.ros.cmd_msg.effort[6] = 1
-        self.ros.cmd_msg.velocity[6] = 0.0
-        self.ros.joint_pub.publish(self.ros.cmd_msg)
 
 
     def step(self) -> None:
-        t = rospy.get_time() - self.ros.T0
         t = rospy.get_time() - self.ros.T0
 
         # GPR Prediction Setup
@@ -334,57 +314,10 @@ class PhysController(Controller):
             self.ros.pred1_pub.publish(Float32(y_pred1_val))
             self.ros.pred2_pub.publish(Float32(y_pred2_val))
 
-        F_gripper_fb = 1 * y_pred1_val + 0 * y_pred2_val   #TODO weighted?    
-        F_desired = self.gripper_force_ref(t)
-        F_error = F_desired - F_gripper_fb
-
-        # pred_avg_pub.publish(loadcell *9.81 / 1000.0)  # Publish LoadCell as the average prediction for reference
-
-        self.ros.pred_avg_pub.publish(F_desired)  # Publish LoadCell as the average prediction for reference
-
-        # Compute Derivative tracking data state
-        d_error_raw = (F_error - self.F_error_prev) / self.dt
-        self.d_error_filtered = self.alpha * d_error_raw + (1.0 - self.alpha) * self.d_error_filtered
-
-        # Execute unified controller function
-        delta_angle = self.gripper_force_controller(self.CONTROL_MODE, F_error, self.F_error_Int, self.d_error_filtered)
-        
-        if delta_angle is None:
-            rospy.logerr(f"Unknown control mode: {self.CONTROL_MODE}")
-            raise RuntimeError(f"Unknown control mode: {self.CONTROL_MODE}")
-
-        angle_suggested = self.angle_cmd - delta_angle
 
 
-        if angle_suggested > 0.06:
-            self.angle = 0.06
-        else:
-            self.angle = angle_suggested
-            self.angle_cmd = angle_suggested
-            self.F_error_Int = self.F_error_Int + F_error * self.dt
-            
-        # Update running derivative tracking state
-        self.F_error_prev = F_error
-        #self.ros.current_positions[6] = self.angle
-        #self.target_angles[6] = self.angle
-        
-        # Build and send message out to the CAN 
-        #self.ros.cmd_msg.header.stamp = rospy.Time.now()
-        #self.ros.cmd_msg.position = self.ros.current_positions
-        #self.ros.cmd_msg.effort[6] = 1
-        #self.ros.cmd_msg.velocity[6] = 0.0
-        #self.ros.joint_pub.publish(self.ros.cmd_msg)
-
-        self.file.write(
-            "{:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f}  {:.6f} {:.6f} {:.6f} {:.6f} {:.6f}\n".format(
-                t, self.ros.fsr1, self.ros.fsr2, self.ros.loadcell, y_pred1_val, y_pred2_val,
-                self.angle, self.ros.gripper_pos, self.ros.gripper_eff, F_desired,
-                std1_val, std2_val
-            )
-        )
-
-        if t > 500.0:
-            self.stop()
+        #if t > 500.0:
+        #    self.stop()
 
         
         self.ros.rate.sleep()
@@ -393,3 +326,6 @@ class PhysController(Controller):
         return self.y_pred1_val
     def get_force_right(self) -> float:
         return self.y_pred2_val
+
+    def _clamp(self, val, min, max):
+        return max(min, min(val, max))

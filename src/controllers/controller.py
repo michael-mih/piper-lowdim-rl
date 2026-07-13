@@ -41,5 +41,3 @@ class Controller(ABC):
 
     def get_force_average(self) -> float:
         return (self.get_force_left() + self.get_force_right()) / 2
-
-    
