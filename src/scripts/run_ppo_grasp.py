@@ -4,18 +4,15 @@ import argparse
 
 import numpy as np
 
-from controllers.sim_controller import SimController
 from learning.env import GraspEnvConfig, GraspPPOEnv, ObservationConfig, RewardConfig
 from learning.ppo import PPOAgent
-from scripts.build_sim import combined_xml
-from scripts.train_ppo_grasp import PIDController
 
 
 # Change this value to set the simulated cube mass in kilograms.
 CUBE_MASS_KG = 0.2
 
 
-def set_sim_cube_mass(controller: SimController, mass_kg: float) -> None:
+def set_sim_cube_mass(controller, mass_kg: float) -> None:
     if mass_kg <= 0.0:
         raise ValueError("CUBE_MASS_KG must be greater than zero")
 
@@ -44,7 +41,11 @@ def parse_args() -> argparse.Namespace:
         description="Run a trained PPO gripper policy in simulation or on Piper."
     )
     parser.add_argument("checkpoint", help="Checkpoint produced by train-ppo-grasp.")
-    parser.add_argument("--model-path", default=str(combined_xml), help="MuJoCo XML path.")
+    parser.add_argument(
+        "--model-path",
+        default=None,
+        help="MuJoCo XML path. Only used with --controller sim.",
+    )
 
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--min-force", type=float, default=None)
@@ -160,11 +161,16 @@ def main() -> None:
     controller = None
     try:
         if args.controller == "sim":
+            from controllers.sim_controller import SimController
+
+            model_path = args.model_path
+            if model_path is None:
+                from scripts.build_sim import combined_xml
+
+                model_path = str(combined_xml)
             controller = SimController(
-                pid_controllers=[
-                    PIDController(0.01, 0.0, 0.0) for _ in range(8)
-                ],
-                model_path=args.model_path,
+                pid_controllers=[],
+                model_path=model_path,
                 render=not args.no_render,
             )
             set_sim_cube_mass(controller, CUBE_MASS_KG)
@@ -172,9 +178,7 @@ def main() -> None:
             from controllers.phys_controller import PhysController
 
             controller = PhysController(
-                pid_controllers=[
-                    PIDController(0.01, 0.0, 0.0) for _ in range(8)
-                ],
+                pid_controllers=[],
                 channel=args.can_channel,
                 gpr_model_path=args.gpr_model_path,
                 feedback_timeout_s=args.feedback_timeout,
