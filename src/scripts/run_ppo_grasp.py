@@ -221,7 +221,18 @@ def main() -> None:
                 )
         print(f"termination_reason={info.get('reason') or 'unknown'}")
 
-        if args.controller == "sim" and not args.no_render:
+        if args.controller == "phys" and not getattr(controller, "_stopped", False):
+            import rospy
+
+            hold_command = controller.get_joint_angle_cmd()
+            print("Holding final robot pose. Press Ctrl-C to stop.")
+            try:
+                while not rospy.is_shutdown():
+                    controller.send_joint_angle_cmd(hold_command)
+                    controller.step()
+            except (KeyboardInterrupt, rospy.ROSInterruptException):
+                pass
+        elif args.controller == "sim" and not args.no_render:
             while True:
                 env.controller.step()
     finally:
