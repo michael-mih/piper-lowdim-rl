@@ -199,6 +199,7 @@ class PhysController(Controller):
             self.driver_auto_enable = None
             self.gripper_srv = None
             self.stop_srv = None
+            self.reset_srv = None
             self.enable_srv = None
 
             # ROS Subscribers
@@ -219,10 +220,16 @@ class PhysController(Controller):
             self.pred_avg_pub = rospy.Publisher('/gpr_prediction_avg', Float32, queue_size=10)
 
             try:
-                for service_name in ("/gripper_srv", "/stop_srv", "/enable_srv"):
+                for service_name in (
+                    "/gripper_srv",
+                    "/stop_srv",
+                    "/reset_srv",
+                    "/enable_srv",
+                ):
                     rospy.wait_for_service(service_name, timeout=feedback_timeout_s)
                 self.gripper_srv = rospy.ServiceProxy("/gripper_srv", Gripper)
                 self.stop_srv = rospy.ServiceProxy("/stop_srv", Trigger)
+                self.reset_srv = rospy.ServiceProxy("/reset_srv", Trigger)
                 self.enable_srv = rospy.ServiceProxy("/enable_srv", Enable)
 
                 self.wait_for_feedback(feedback_timeout_s)
@@ -263,6 +270,16 @@ class PhysController(Controller):
                 raise RuntimeError(f"Failed to enable Piper arm: {e}") from e
             if not response.enable_response:
                 raise RuntimeError("Piper arm enable service reported failure")
+
+        def reset_arm(self):
+            try:
+                response = self.reset_srv()
+            except rospy.ServiceException as e:
+                raise RuntimeError(f"Failed to reset Piper arm stop state: {e}") from e
+            if not response.success:
+                raise RuntimeError(
+                    f"Piper arm reset service reported failure: {response.message}"
+                )
 
         def wait_for_feedback(self, timeout_s):
             required = ("fsr1", "fsr2", "joints", "arm_status")
@@ -549,6 +566,7 @@ class PhysController(Controller):
                 # Refresh the driver's private enable flag even when its startup
                 # auto-enable option is true. This also handles a prior controller
                 # instance having disabled the arm during shutdown.
+                self.ros.reset_arm()
                 self.ros.enable_arm()
                 self.ros.enable_gripper(target_angle=actual[6])
                 self._enabled = True
