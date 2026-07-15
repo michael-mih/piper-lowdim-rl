@@ -196,6 +196,7 @@ class PhysController(Controller):
             }
             self._invalid_feedback = {}
             self._stopped = False
+            self.driver_auto_enable = None
             self.gripper_srv = None
             self.stop_srv = None
             self.enable_srv = None
@@ -240,9 +241,11 @@ class PhysController(Controller):
             self.rate = rospy.Rate(self.ROS_Freq)
             self.T0 = rospy.get_time()
 
-        def enable_gripper(self):
+        def enable_gripper(self, target_angle=None):
             enable_req = GripperRequest()
-            enable_req.gripper_angle = float(self.current_positions[6])
+            enable_req.gripper_angle = float(
+                self.current_positions[6] if target_angle is None else target_angle
+            )
             enable_req.gripper_effort = 0.5
             enable_req.gripper_code = 0x01
             enable_req.set_zero = 0
@@ -298,11 +301,28 @@ class PhysController(Controller):
                 )
                 for name in matching_params
             }
-            if any(value is not False for value in auto_enable_params.values()):
+            invalid_values = {
+                name: value
+                for name, value in auto_enable_params.items()
+                if not isinstance(value, bool)
+            }
+            if invalid_values:
                 raise RuntimeError(
-                    "Piper ROS driver must be launched with auto_enable:=false so safety "
-                    f"checks run before arm enable; discovered: {auto_enable_params}"
+                    "Piper ROS driver auto_enable parameters must be booleans; "
+                    f"discovered: {invalid_values}"
                 )
+            unique_values = set(auto_enable_params.values())
+            if len(unique_values) != 1:
+                raise RuntimeError(
+                    "Multiple matching Piper ROS drivers disagree on auto_enable: "
+                    f"{auto_enable_params}"
+                )
+            self.driver_auto_enable = unique_values.pop()
+            rospy.loginfo(
+                "Using Piper driver on %s with auto_enable=%s",
+                expected_channel,
+                self.driver_auto_enable,
+            )
 
         def assert_feedback_safe(self):
             required = ("fsr1", "fsr2", "joints", "arm_status")
@@ -526,8 +546,11 @@ class PhysController(Controller):
         self.target_angles = list(actual)
         if not self._enabled:
             try:
+                # Refresh the driver's private enable flag even when its startup
+                # auto-enable option is true. This also handles a prior controller
+                # instance having disabled the arm during shutdown.
                 self.ros.enable_arm()
-                self.ros.enable_gripper()
+                self.ros.enable_gripper(target_angle=actual[6])
                 self._enabled = True
             except Exception:
                 self.emergency_stop()
