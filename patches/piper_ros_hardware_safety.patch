@@ -1,0 +1,47 @@
+diff --git a/src/piper/scripts/piper_ctrl_single_node.py b/src/piper/scripts/piper_ctrl_single_node.py
+--- a/src/piper/scripts/piper_ctrl_single_node.py
++++ b/src/piper/scripts/piper_ctrl_single_node.py
+@@ -151,5 +151,6 @@ class C_PiperRosNode():
+                     print("使能状态:",enable_flag)
+                     self.piper.EnableArm(7)
+-                    self.piper.GripperCtrl(0,1000,0x01, 0)
++                    current_gripper = self.piper.GetArmGripperMsgs().gripper_state.grippers_angle
++                    self.piper.GripperCtrl(abs(current_gripper),1000,0x01, 0)
+                     if(enable_flag):
+                         self.__enable_flag = True
+@@ -405,6 +406,7 @@ class C_PiperRosNode():
+             self.__enable_flag = True
+             self.piper.EnableArm(7)
+             if(self.gripper_exist):
+-                self.piper.GripperCtrl(0,1000,0x01, 0)
++                current_gripper = self.piper.GetArmGripperMsgs().gripper_state.grippers_angle
++                self.piper.GripperCtrl(abs(current_gripper),1000,0x01, 0)
+         else:
+             self.__enable_flag = False
+@@ -478,6 +480,7 @@ class C_PiperRosNode():
+             if(req.enable_request):
+                 enable_flag = all(enable_list)
+                 self.piper.EnableArm(7)
+-                self.piper.GripperCtrl(0,1000,0x01, 0)
++                current_gripper = self.piper.GetArmGripperMsgs().gripper_state.grippers_angle
++                self.piper.GripperCtrl(abs(current_gripper),1000,0x01, 0)
+             else:
+                 enable_flag = any(enable_list)
+diff --git a/src/piper/launch/start_single_piper.launch b/src/piper/launch/start_single_piper.launch
+--- a/src/piper/launch/start_single_piper.launch
++++ b/src/piper/launch/start_single_piper.launch
+@@ -1,4 +1,4 @@
+ <launch>
+   <arg name="can_port" default="can0" />
+-  <arg name="auto_enable" default="true" />
++  <arg name="auto_enable" default="false" />
+   <arg name="gripper_val_mutiple" default="1" />
+diff --git a/src/piper/launch/start_single_piper_rviz.launch b/src/piper/launch/start_single_piper_rviz.launch
+--- a/src/piper/launch/start_single_piper_rviz.launch
++++ b/src/piper/launch/start_single_piper_rviz.launch
+@@ -1,4 +1,4 @@
+ <launch>
+   <arg name="can_port" default="can0" />
+-  <arg name="auto_enable" default="true" />
++  <arg name="auto_enable" default="false" />
+   <arg name="gripper_val_mutiple" default="1" />

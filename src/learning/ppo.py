@@ -53,6 +53,35 @@ def _discount_cumsum(values: np.ndarray, discount: float) -> np.ndarray:
 
 if torch is not None:
 
+    class SquashedNormal:
+        """Independent tanh-squashed Normal components on the interval (-1, 1)."""
+
+        def __init__(self, mean: "torch.Tensor", std: "torch.Tensor") -> None:
+            self.base_distribution = Normal(mean, std)
+
+        @property
+        def mean(self) -> "torch.Tensor":
+            return torch.tanh(self.base_distribution.mean)
+
+        def sample(self) -> "torch.Tensor":
+            return torch.tanh(self.base_distribution.sample())
+
+        def rsample(self) -> "torch.Tensor":
+            return torch.tanh(self.base_distribution.rsample())
+
+        def log_prob(self, action: "torch.Tensor") -> "torch.Tensor":
+            epsilon = torch.finfo(action.dtype).eps
+            bounded_action = action.clamp(-1.0 + epsilon, 1.0 - epsilon)
+            raw_action = torch.atanh(bounded_action)
+            log_det_jacobian = torch.log1p(-bounded_action.pow(2))
+            return self.base_distribution.log_prob(raw_action) - log_det_jacobian
+
+        def entropy(self) -> "torch.Tensor":
+            # A tanh-transformed Normal has no closed-form entropy. One
+            # reparameterized sample provides a differentiable Monte Carlo estimate.
+            action = self.rsample()
+            return -self.log_prob(action)
+
     class ActorCritic(nn.Module):
         def __init__(self, observation_dim: int, num_actions: int, hidden_sizes: Sequence[int]) -> None:
             super().__init__()
@@ -62,7 +91,7 @@ if torch is not None:
                 layers.extend([nn.Linear(last_dim, hidden_size), nn.Tanh()])
                 last_dim = hidden_size
             self.shared = nn.Sequential(*layers)
-            self.mean_head = nn.Linear(last_dim, num_actions) #gripper_mean, joint5_mean
+            self.mean_head = nn.Linear(last_dim, num_actions) #desired_force_mean, joint5_mean
             self.log_std_head = nn.Linear(last_dim, num_actions)
             self.value_head = nn.Linear(last_dim, 1)
 
@@ -70,13 +99,11 @@ if torch is not None:
             features = self.shared(obs)
             return self.mean_head(features), self.log_std_head(features), self.value_head(features).squeeze(-1)
 
-        def distribution(self, obs: "torch.Tensor") -> "Normal":
+        def distribution(self, obs: "torch.Tensor") -> "SquashedNormal":
             mean, log_std, _ = self(obs)
-            
-            log_std = torch.clamp(log_std, -5, 2) #TODO: bounds?
-            mean = torch.clamp(mean, -1, 1)
+            log_std = torch.clamp(log_std, -5, 2)
             std = torch.exp(log_std)
-            return Normal(mean, std)
+            return SquashedNormal(mean, std)
 
         def value(self, obs: "torch.Tensor") -> "torch.Tensor":
             _, _, value = self(obs)
@@ -168,6 +195,7 @@ class PPOAgent:
             hidden_sizes=config.hidden_sizes,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate, betas=(0.9, 0.999))
+        self.environment_metadata: Optional[Dict[str, Any]] = None
 
     def step(self, obs: np.ndarray) -> Tuple[np.ndarray, float, float]:
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -263,6 +291,7 @@ class PPOAgent:
                 "config": self.config,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
+                "environment_metadata": self.environment_metadata,
             },
             Path(path),
         )
@@ -277,6 +306,7 @@ class PPOAgent:
         agent = cls(config)
         agent.model.load_state_dict(checkpoint["model_state_dict"])
         agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        agent.environment_metadata = checkpoint.get("environment_metadata")
         return agent
 
 
@@ -370,4 +400,3 @@ class PPOTrainer:
             )
             if save_path is not None:
                 self.agent.save(save_path)
-

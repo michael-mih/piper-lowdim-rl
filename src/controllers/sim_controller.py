@@ -24,6 +24,8 @@ class SimController(Controller):
         self.drop_termination_offset_m = 1.0
         self.object_dropped = False
 
+        self.dt = self.sim.model.opt.timestep
+
        
 
 

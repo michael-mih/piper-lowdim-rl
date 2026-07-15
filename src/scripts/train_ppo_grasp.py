@@ -66,7 +66,7 @@ class BoxDistribution:
     x_half_extent_range_m: Tuple[float, float] = (0.016, 0.024)
     y_half_extent_range_m: Tuple[float, float] = (0.008, 0.014)
     z_half_extent_range_m: Tuple[float, float] = (0.036, 0.044)
-    mass_range_kg: Tuple[float, float] = (0.06, 0.14)
+    mass_range_kg: Tuple[float, float] = (0.06, 0.8)
 
     def sample(self, rng: np.random.Generator) -> BoxSample:
         half_extents = (
@@ -823,6 +823,8 @@ def main() -> None:
     total_timesteps = args.total_timesteps if args.total_timesteps is not None else 100000
     print(f"training_device={config.device}")
     agent = PPOAgent(config)
+    policy_env = getattr(env, "env", env)
+    agent.environment_metadata = policy_env.policy_metadata()
     trainer = PPOTrainer(env, agent, config)
     trainer.train(total_timesteps=total_timesteps, save_path=Path(args.save_path))
 

@@ -180,6 +180,14 @@ ET.SubElement(
 contact = root.find("contact")
 if contact is None:
     contact = ET.SubElement(root, "contact")
+ET.SubElement(
+    contact,
+    "exclude",
+    {
+        "body1": "link7",
+        "body2": "link8",
+    },
+)
 for pad_name in pad_names:
     ET.SubElement(
         contact,
