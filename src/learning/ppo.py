@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import multiprocessing as mp
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+import traceback
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -198,13 +200,34 @@ class PPOAgent:
         self.environment_metadata: Optional[Dict[str, Any]] = None
 
     def step(self, obs: np.ndarray) -> Tuple[np.ndarray, float, float]:
-        obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        actions, log_probs, values = self.step_batch(np.asarray(obs)[None, :])
+        return actions[0], float(log_probs[0]), float(values[0])
+
+    def step_batch(
+        self,
+        observations: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        observations = np.asarray(observations, dtype=np.float32)
+        if observations.ndim != 2:
+            raise ValueError(
+                "Batched observations must have shape "
+                f"(num_envs, observation_dim), got {observations.shape}"
+            )
+        obs_tensor = torch.as_tensor(
+            observations,
+            dtype=torch.float32,
+            device=self.device,
+        )
         with torch.no_grad():
             distribution = self.model.distribution(obs_tensor)
             action = distribution.sample()
             log_prob = distribution.log_prob(action).sum(-1)
             value = self.model.value(obs_tensor)
-        return action.squeeze(0).cpu().numpy(), float(log_prob.item()), float(value.item())
+        return (
+            action.cpu().numpy(),
+            log_prob.cpu().numpy(),
+            value.cpu().numpy(),
+        )
 
     def act(
         self,
@@ -221,10 +244,23 @@ class PPOAgent:
         return action.squeeze(0).cpu().numpy()
 
     def value(self, obs: np.ndarray) -> float:
-        obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        return float(self.value_batch(np.asarray(obs)[None, :])[0])
+
+    def value_batch(self, observations: np.ndarray) -> np.ndarray:
+        observations = np.asarray(observations, dtype=np.float32)
+        if observations.ndim != 2:
+            raise ValueError(
+                "Batched observations must have shape "
+                f"(num_envs, observation_dim), got {observations.shape}"
+            )
+        obs_tensor = torch.as_tensor(
+            observations,
+            dtype=torch.float32,
+            device=self.device,
+        )
         with torch.no_grad():
             value = self.model.value(obs_tensor)
-        return float(value.item())
+        return value.cpu().numpy()
 
     def update(self, data: Dict[str, "torch.Tensor"]) -> Dict[str, float]:
         obs = data["obs"]
@@ -310,6 +346,176 @@ class PPOAgent:
         return agent
 
 
+def _subprocess_env_worker(connection: Any, env_factory: Callable[[], Any]) -> None:
+    env = None
+    try:
+        env = env_factory()
+        connection.send(
+            (
+                "ready",
+                {
+                    "observation_dim": int(env.observation_dim),
+                    "num_actions": int(env.num_actions),
+                },
+            )
+        )
+        while True:
+            command, payload = connection.recv()
+            if command == "reset":
+                connection.send(("ok", env.reset()))
+            elif command == "step":
+                connection.send(("ok", env.step(payload)))
+            elif command == "close":
+                close = getattr(env, "close", None)
+                if callable(close):
+                    close()
+                connection.send(("ok", None))
+                return
+            else:
+                raise ValueError(f"Unknown environment worker command: {command!r}")
+    except EOFError:
+        return
+    except BaseException:
+        try:
+            connection.send(("error", traceback.format_exc()))
+        except (BrokenPipeError, EOFError):
+            pass
+    finally:
+        connection.close()
+
+
+class SubprocessVectorEnv:
+    """Run independent environments in spawned worker processes."""
+
+    def __init__(self, env_factories: Sequence[Callable[[], Any]]) -> None:
+        if not env_factories:
+            raise ValueError("At least one environment factory is required")
+
+        self._closed = False
+        self._connections: List[Any] = []
+        self._processes: List[mp.Process] = []
+        context = mp.get_context("spawn")
+
+        try:
+            for env_factory in env_factories:
+                parent_connection, child_connection = context.Pipe()
+                process = context.Process(
+                    target=_subprocess_env_worker,
+                    args=(child_connection, env_factory),
+                    daemon=True,
+                )
+                process.start()
+                child_connection.close()
+                self._connections.append(parent_connection)
+                self._processes.append(process)
+
+            environment_specs = [
+                self._receive(index, expected_status="ready")
+                for index in range(len(self._connections))
+            ]
+            first_spec = environment_specs[0]
+            for worker_index, spec in enumerate(environment_specs[1:], start=1):
+                if spec != first_spec:
+                    raise ValueError(
+                        f"Environment worker {worker_index} has incompatible dimensions: "
+                        f"{spec!r} != {first_spec!r}"
+                    )
+            self.observation_dim = int(first_spec["observation_dim"])
+            self.num_actions = int(first_spec["num_actions"])
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def num_envs(self) -> int:
+        return len(self._connections)
+
+    def reset(self, worker_indices: Optional[Sequence[int]] = None) -> np.ndarray:
+        indices = self._resolve_indices(worker_indices)
+        for index in indices:
+            self._connections[index].send(("reset", None))
+        observations = [self._receive(index) for index in indices]
+        return np.asarray(observations, dtype=np.float32)
+
+    def step(
+        self,
+        worker_indices: Sequence[int],
+        actions: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+        indices = self._resolve_indices(worker_indices)
+        actions = np.asarray(actions, dtype=np.float32)
+        expected_shape = (len(indices), self.num_actions)
+        if actions.shape != expected_shape:
+            raise ValueError(
+                f"Expected batched action shape {expected_shape}, got {actions.shape}"
+            )
+
+        for index, action in zip(indices, actions):
+            self._connections[index].send(("step", action))
+        results = [self._receive(index) for index in indices]
+        observations, rewards, dones, infos = zip(*results)
+        return (
+            np.asarray(observations, dtype=np.float32),
+            np.asarray(rewards, dtype=np.float32),
+            np.asarray(dones, dtype=np.bool_),
+            list(infos),
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        for connection, process in zip(self._connections, self._processes):
+            if process.is_alive():
+                try:
+                    connection.send(("close", None))
+                except (BrokenPipeError, EOFError):
+                    pass
+        for index, (connection, process) in enumerate(
+            zip(self._connections, self._processes)
+        ):
+            if process.is_alive():
+                try:
+                    self._receive(index)
+                except (RuntimeError, EOFError, BrokenPipeError):
+                    pass
+            process.join(timeout=5.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5.0)
+            connection.close()
+
+    def _resolve_indices(
+        self,
+        worker_indices: Optional[Sequence[int]],
+    ) -> List[int]:
+        indices = (
+            list(range(self.num_envs))
+            if worker_indices is None
+            else [int(index) for index in worker_indices]
+        )
+        if len(set(indices)) != len(indices):
+            raise ValueError("Environment worker indices must be unique")
+        for index in indices:
+            if index < 0 or index >= self.num_envs:
+                raise IndexError(f"Environment worker index {index} is out of range")
+        return indices
+
+    def _receive(self, worker_index: int, expected_status: str = "ok") -> Any:
+        status, payload = self._connections[worker_index].recv()
+        if status == "error":
+            raise RuntimeError(
+                f"Environment worker {worker_index} failed:\n{payload}"
+            )
+        if status != expected_status:
+            raise RuntimeError(
+                f"Environment worker {worker_index} returned unexpected status "
+                f"{status!r}; expected {expected_status!r}"
+            )
+        return payload
+
+
 class PPOTrainer:
     def __init__(self, env: Any, agent: PPOAgent, config: Optional[PPOConfig] = None) -> None:
         self.env = env
@@ -384,6 +590,198 @@ class PPOTrainer:
         return buffer.get(self.config.device), rollout_info
 
     def train(self, total_timesteps: int, save_path: Optional[Union[str, Path]] = None) -> None:
+        updates = max(1, int(total_timesteps) // self.config.rollout_steps)
+        for update_idx in range(updates):
+            data, rollout_info = self.collect_rollout()
+            update_info = self.agent.update(data)
+            print(
+                "update={update} episodes={episodes:.0f} success_rate={success_rate:.3f} "
+                "mean_return={mean_return:.3f} mean_length={mean_length:.1f} "
+                "mean_success_gripper_force={mean_success_gripper_force:.3f} "
+                "kl={kl:.5f} entropy={entropy:.3f}".format(
+                    update=update_idx + 1,
+                    **rollout_info,
+                    **update_info,
+                )
+            )
+            if save_path is not None:
+                self.agent.save(save_path)
+
+
+class ParallelPPOTrainer:
+    """Collect PPO rollouts concurrently from subprocess environments."""
+
+    def __init__(
+        self,
+        env: SubprocessVectorEnv,
+        agent: PPOAgent,
+        config: Optional[PPOConfig] = None,
+    ) -> None:
+        self.env = env
+        self.agent = agent
+        self.config = config or agent.config
+        self.completed_episodes = 0
+        if self.env.num_envs > self.config.rollout_steps:
+            raise ValueError(
+                "num_envs cannot exceed rollout_steps because every worker must "
+                "contribute at least one sample"
+            )
+
+    def collect_rollout(self) -> Tuple[Dict[str, "torch.Tensor"], Dict[str, float]]:
+        buffer = RolloutBuffer(
+            observation_dim=self.config.observation_dim,
+            num_actions=self.env.num_actions,
+            size=self.config.rollout_steps,
+            gamma=self.config.gamma,
+            gae_lambda=self.config.gae_lambda,
+        )
+        observations = self.env.reset()
+        base_steps, extra_steps = divmod(
+            self.config.rollout_steps,
+            self.env.num_envs,
+        )
+        remaining_steps = [
+            base_steps + int(index < extra_steps)
+            for index in range(self.env.num_envs)
+        ]
+        pending_paths: List[List[Tuple[np.ndarray, np.ndarray, float, float, float]]] = [
+            [] for _ in range(self.env.num_envs)
+        ]
+        episode_returns = [0.0 for _ in range(self.env.num_envs)]
+        episode_lengths = [0 for _ in range(self.env.num_envs)]
+        recent_gripper_forces = [
+            deque(maxlen=5) for _ in range(self.env.num_envs)
+        ]
+
+        completed_returns: List[float] = []
+        completed_lengths: List[int] = []
+        successful_episode_forces: List[float] = []
+        successes = 0
+        completed_episodes = 0
+
+        while any(steps > 0 for steps in remaining_steps):
+            active_indices = [
+                index
+                for index, steps in enumerate(remaining_steps)
+                if steps > 0
+            ]
+            active_observations = observations[active_indices]
+            actions, log_probs, values = self.agent.step_batch(active_observations)
+            next_observations, rewards, dones, infos = self.env.step(
+                active_indices,
+                actions,
+            )
+            reset_indices: List[int] = []
+
+            for batch_index, worker_index in enumerate(active_indices):
+                info = infos[batch_index]
+                pending_paths[worker_index].append(
+                    (
+                        observations[worker_index].copy(),
+                        actions[batch_index].copy(),
+                        float(rewards[batch_index]),
+                        float(values[batch_index]),
+                        float(log_probs[batch_index]),
+                    )
+                )
+                observations[worker_index] = next_observations[batch_index]
+                remaining_steps[worker_index] -= 1
+
+                average_gripper_force = 0.5 * (
+                    float(info["left_force_n"]) + float(info["right_force_n"])
+                )
+                recent_gripper_forces[worker_index].append(average_gripper_force)
+                episode_returns[worker_index] += float(rewards[batch_index])
+                episode_lengths[worker_index] += 1
+
+                if not bool(dones[batch_index]):
+                    continue
+
+                terminal = not bool(info.get("truncated", False))
+                last_value = (
+                    0.0
+                    if terminal
+                    else self.agent.value(observations[worker_index])
+                )
+                self._finish_pending_path(
+                    buffer,
+                    pending_paths[worker_index],
+                    last_value,
+                )
+
+                self.completed_episodes += 1
+                completed_episodes += 1
+                completed_returns.append(episode_returns[worker_index])
+                completed_lengths.append(episode_lengths[worker_index])
+                success = bool(info.get("success", False))
+                successes += int(success)
+                if success:
+                    successful_episode_forces.append(
+                        float(np.mean(recent_gripper_forces[worker_index]))
+                    )
+                print(
+                    f"episode={self.completed_episodes} worker={worker_index} "
+                    f"termination_reason={info.get('reason') or 'unknown'}"
+                )
+
+                episode_returns[worker_index] = 0.0
+                episode_lengths[worker_index] = 0
+                recent_gripper_forces[worker_index].clear()
+                if remaining_steps[worker_index] > 0:
+                    reset_indices.append(worker_index)
+
+            if reset_indices:
+                reset_observations = self.env.reset(reset_indices)
+                for reset_index, worker_index in enumerate(reset_indices):
+                    observations[worker_index] = reset_observations[reset_index]
+
+        unfinished_indices = [
+            index for index, path in enumerate(pending_paths) if path
+        ]
+        if unfinished_indices:
+            last_values = self.agent.value_batch(observations[unfinished_indices])
+            for batch_index, worker_index in enumerate(unfinished_indices):
+                self._finish_pending_path(
+                    buffer,
+                    pending_paths[worker_index],
+                    float(last_values[batch_index]),
+                )
+
+        rollout_info = {
+            "episodes": float(completed_episodes),
+            "success_rate": (
+                float(successes / completed_episodes) if completed_episodes else 0.0
+            ),
+            "mean_return": (
+                float(np.mean(completed_returns)) if completed_returns else 0.0
+            ),
+            "mean_length": (
+                float(np.mean(completed_lengths)) if completed_lengths else 0.0
+            ),
+            "mean_success_gripper_force": (
+                float(np.mean(successful_episode_forces))
+                if successful_episode_forces
+                else 0.0
+            ),
+        }
+        return buffer.get(self.config.device), rollout_info
+
+    @staticmethod
+    def _finish_pending_path(
+        buffer: RolloutBuffer,
+        path: List[Tuple[np.ndarray, np.ndarray, float, float, float]],
+        last_value: float,
+    ) -> None:
+        for observation, action, reward, value, log_prob in path:
+            buffer.store(observation, action, reward, value, log_prob)
+        buffer.finish_path(last_value)
+        path.clear()
+
+    def train(
+        self,
+        total_timesteps: int,
+        save_path: Optional[Union[str, Path]] = None,
+    ) -> None:
         updates = max(1, int(total_timesteps) // self.config.rollout_steps)
         for update_idx in range(updates):
             data, rollout_info = self.collect_rollout()

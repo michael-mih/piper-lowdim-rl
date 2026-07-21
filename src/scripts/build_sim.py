@@ -9,7 +9,7 @@ box_half_extents = "0.02 0.01 0.04"
 support_half_extents = "0.035 0.025 0.04"
 finger_pad_position = "0 -0.02 -0.0005"
 finger_pad_half_extents = "0.015 0.015 0.001"
-finger_pad_friction = "1 1 0.1 0.01 0.01"
+finger_pad_friction = "1.2 1.2 0.1 0.01 0.01"
 
 
 current_path = os.path.dirname(os.path.realpath(__file__))
@@ -56,7 +56,7 @@ for position_actuator in actuator.findall("position"):
     if position_actuator.get("joint") in ("joint7", "joint8"):
         position_actuator.set("kp", "1000")
         position_actuator.set("forcelimited", "true")
-        position_actuator.set("forcerange", "-2 2")
+        position_actuator.set("forcerange", "-4 4")
 
 pad_names = []
 for finger_body, side in (

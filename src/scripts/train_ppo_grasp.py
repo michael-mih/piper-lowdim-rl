@@ -10,7 +10,13 @@ import numpy as np
 
 from controllers.sim_controller import SimController
 from learning.env import GraspEnvConfig, GraspPPOEnv, ObservationConfig, RewardConfig
-from learning.ppo import PPOAgent, PPOConfig, PPOTrainer
+from learning.ppo import (
+    PPOAgent,
+    PPOConfig,
+    PPOTrainer,
+    ParallelPPOTrainer,
+    SubprocessVectorEnv,
+)
 from scripts.build_sim import combined_xml
 
 
@@ -66,7 +72,7 @@ class BoxDistribution:
     x_half_extent_range_m: Tuple[float, float] = (0.016, 0.024)
     y_half_extent_range_m: Tuple[float, float] = (0.008, 0.014)
     z_half_extent_range_m: Tuple[float, float] = (0.036, 0.044)
-    mass_range_kg: Tuple[float, float] = (0.06, 0.8)
+    mass_range_kg: Tuple[float, float] = (0.1, 0.6)
 
     def sample(self, rng: np.random.Generator) -> BoxSample:
         half_extents = (
@@ -604,6 +610,93 @@ class RandomizedBoxGraspEnv:
         return self.env.observation_dict()
 
 
+@dataclass(frozen=True)
+class TrainingEnvFactory:
+    mode: str
+    model_path: str
+    env_config: GraspEnvConfig
+    observation_config: ObservationConfig
+    reward_config: RewardConfig
+    seed: Optional[int]
+    render: bool
+    support_xy: Optional[Tuple[float, float]] = None
+    support_top_z: Optional[float] = None
+    box_specs: Tuple[TrainingBoxSpec, ...] = ()
+    box_distribution: Optional[BoxDistribution] = None
+
+    def __call__(self):
+        pid_controllers = [
+            PIDController(0.01, 0.0, 0.0) for _ in range(8)
+        ]
+        if self.mode == "single":
+            controller = SimController(
+                pid_controllers=pid_controllers,
+                model_path=self.model_path,
+                render=self.render,
+            )
+            return GraspPPOEnv(
+                controller=controller,
+                object_height_fn=lambda controller: None,
+                env_config=self.env_config,
+                observation_config=self.observation_config,
+                reward_config=self.reward_config,
+                seed=self.seed,
+            )
+
+        if self.support_xy is None or self.support_top_z is None:
+            raise ValueError(f"{self.mode} training requires support geometry")
+
+        if self.mode == "fixed":
+            controller = MultiBoxSimController(
+                pid_controllers=pid_controllers,
+                model_path=self.model_path,
+                box_specs=self.box_specs,
+                support_xy=self.support_xy,
+                support_top_z=self.support_top_z,
+                render=self.render,
+            )
+            base_env = GraspPPOEnv(
+                controller=controller,
+                env_config=self.env_config,
+                observation_config=self.observation_config,
+                reward_config=self.reward_config,
+                seed=self.seed,
+            )
+            return RandomBoxGraspEnv(
+                env=base_env,
+                controller=controller,
+                box_specs=self.box_specs,
+                seed=None if self.seed is None else self.seed + 1,
+            )
+
+        if self.mode == "randomized":
+            if self.box_distribution is None:
+                raise ValueError("Randomized training requires a box distribution")
+            controller = RandomizedBoxSimController(
+                pid_controllers=pid_controllers,
+                model_path=self.model_path,
+                box_template=RANDOMIZED_BOX_TEMPLATE,
+                support_xy=self.support_xy,
+                support_top_z=self.support_top_z,
+                render=self.render,
+            )
+            base_env = GraspPPOEnv(
+                controller=controller,
+                env_config=self.env_config,
+                observation_config=self.observation_config,
+                reward_config=self.reward_config,
+                seed=self.seed,
+            )
+            return RandomizedBoxGraspEnv(
+                env=base_env,
+                controller=controller,
+                box_distribution=self.box_distribution,
+                seed=None if self.seed is None else self.seed + 1,
+            )
+
+        raise ValueError(f"Unknown training environment mode: {self.mode!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a lightweight PPO-clip gripper policy.")
     parser.add_argument("--model-path", default=str(combined_xml), help="MuJoCo XML path.")
@@ -625,6 +718,17 @@ def parse_args() -> argparse.Namespace:
         "--no-render",
         action="store_true",
         help="Disable the MuJoCo viewer and run simulation as fast as possible.",
+    )
+    parser.add_argument(
+        "--num-envs",
+        "--num-ens",
+        dest="num_envs",
+        type=int,
+        default=4,
+        help=(
+            "Number of parallel simulation environments used with --no-render "
+            "(default: 4). --num-ens is accepted as an alias."
+        ),
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -683,6 +787,9 @@ def _range_from_args(values: Sequence[float], name: str) -> Tuple[float, float]:
 
 def main() -> None:
     args = parse_args()
+    if args.num_envs < 1:
+        raise ValueError("--num-envs must be at least 1")
+
     device = args.device
     if device == "auto":
         import torch
@@ -704,43 +811,22 @@ def main() -> None:
     if args.min_force is not None:
         observation_config_kwargs["min_force_threshold_n"] = args.min_force
 
+    mode = "single"
+    training_model_path = args.model_path
+    support_xy = None
+    support_top_z = None
+    box_specs: Tuple[TrainingBoxSpec, ...] = ()
+    box_distribution = None
+
     if args.single_box:
-        controller = SimController(
-            pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)],
-            model_path=args.model_path,
-            render=not args.no_render,
-        )
-        env = GraspPPOEnv(
-            controller=controller,
-            object_height_fn=lambda controller: None,
-            env_config=GraspEnvConfig(**env_config_kwargs),
-            observation_config=ObservationConfig(**observation_config_kwargs),
-            reward_config=RewardConfig(),
-            seed=args.seed,
-        )
+        mode = "single"
     elif args.fixed_three_boxes:
+        mode = "fixed"
         scene = build_three_box_scene_xml(args.model_path, TRAINING_BOXES)
-        controller = MultiBoxSimController(
-            pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)],
-            model_path=str(scene.path),
-            box_specs=TRAINING_BOXES,
-            support_xy=scene.support_xy,
-            support_top_z=scene.support_top_z,
-            render=not args.no_render,
-        )
-        base_env = GraspPPOEnv(
-            controller=controller,
-            env_config=GraspEnvConfig(**env_config_kwargs),
-            observation_config=ObservationConfig(**observation_config_kwargs),
-            reward_config=RewardConfig(),
-            seed=args.seed,
-        )
-        env = RandomBoxGraspEnv(
-            env=base_env,
-            controller=controller,
-            box_specs=TRAINING_BOXES,
-            seed=None if args.seed is None else args.seed + 1,
-        )
+        training_model_path = str(scene.path)
+        support_xy = scene.support_xy
+        support_top_z = scene.support_top_z
+        box_specs = TRAINING_BOXES
         print(f"training_model={scene.path}")
         print(
             "training_boxes="
@@ -750,6 +836,7 @@ def main() -> None:
             )
         )
     else:
+        mode = "randomized"
         box_distribution = BoxDistribution(
             x_half_extent_range_m=_range_from_args(
                 args.box_x_half_range,
@@ -773,27 +860,10 @@ def main() -> None:
             **env_config_kwargs,
             "default_body_name": RANDOMIZED_BOX_TEMPLATE.body_name,
         }
-        controller = RandomizedBoxSimController(
-            pid_controllers=[PIDController(0.01, 0.0, 0.0) for _ in range(8)],
-            model_path=str(scene.path),
-            box_template=RANDOMIZED_BOX_TEMPLATE,
-            support_xy=scene.support_xy,
-            support_top_z=scene.support_top_z,
-            render=not args.no_render,
-        )
-        base_env = GraspPPOEnv(
-            controller=controller,
-            env_config=GraspEnvConfig(**randomized_env_config_kwargs),
-            observation_config=ObservationConfig(**observation_config_kwargs),
-            reward_config=RewardConfig(),
-            seed=args.seed,
-        )
-        env = RandomizedBoxGraspEnv(
-            env=base_env,
-            controller=controller,
-            box_distribution=box_distribution,
-            seed=None if args.seed is None else args.seed + 1,
-        )
+        env_config_kwargs = randomized_env_config_kwargs
+        training_model_path = str(scene.path)
+        support_xy = scene.support_xy
+        support_top_z = scene.support_top_z
         print(f"training_model={scene.path}")
         print(
             "box_distribution="
@@ -802,6 +872,41 @@ def main() -> None:
             f"z_half={box_distribution.z_half_extent_range_m}m, "
             f"mass={box_distribution.mass_range_kg}kg"
         )
+
+    env_config = GraspEnvConfig(**env_config_kwargs)
+    observation_config = ObservationConfig(**observation_config_kwargs)
+    reward_config = RewardConfig()
+
+    def env_factory(worker_index: int, render: bool) -> TrainingEnvFactory:
+        worker_seed = (
+            None if args.seed is None else args.seed + worker_index * 2
+        )
+        return TrainingEnvFactory(
+            mode=mode,
+            model_path=training_model_path,
+            env_config=env_config,
+            observation_config=observation_config,
+            reward_config=reward_config,
+            seed=worker_seed,
+            render=render,
+            support_xy=support_xy,
+            support_top_z=support_top_z,
+            box_specs=box_specs,
+            box_distribution=box_distribution,
+        )
+
+    if args.no_render and args.num_envs > 1:
+        env = SubprocessVectorEnv(
+            [env_factory(index, render=False) for index in range(args.num_envs)]
+        )
+        trainer_type = ParallelPPOTrainer
+        active_num_envs = args.num_envs
+    else:
+        env = env_factory(0, render=not args.no_render)()
+        trainer_type = PPOTrainer
+        active_num_envs = 1
+        if not args.no_render and args.num_envs != 4:
+            print("num_envs_ignored_without_no_render=true")
 
     ppo_config_kwargs = {}
     if args.learning_rate is not None:
@@ -822,11 +927,18 @@ def main() -> None:
     )
     total_timesteps = args.total_timesteps if args.total_timesteps is not None else 100000
     print(f"training_device={config.device}")
+    print(f"training_num_envs={active_num_envs}")
     agent = PPOAgent(config)
-    policy_env = getattr(env, "env", env)
-    agent.environment_metadata = policy_env.policy_metadata()
-    trainer = PPOTrainer(env, agent, config)
-    trainer.train(total_timesteps=total_timesteps, save_path=Path(args.save_path))
+    agent.environment_metadata = GraspPPOEnv.policy_metadata_for_configs(
+        env_config,
+        observation_config,
+    )
+    try:
+        trainer = trainer_type(env, agent, config)
+        trainer.train(total_timesteps=total_timesteps, save_path=Path(args.save_path))
+    finally:
+        if isinstance(env, SubprocessVectorEnv):
+            env.close()
 
 
 if __name__ == "__main__":

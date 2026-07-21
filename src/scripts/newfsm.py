@@ -1,61 +1,52 @@
 from controllers.sim_controller import SimController
 from scripts.build_sim import combined_xml
+from scripts.sim_box import set_box_mass
 from fsm.custom_min_grasp_fsm import FSMActor
-import os 
 import argparse
 
 import glfw  # 用于检查窗口关闭事件
 import time
-import asyncio
-
-# 定义PID控制器类
-class PIDController:
-    def __init__(self, Kp, Ki, Kd):
-        self.Kp = Kp
-        self.Ki = Ki
-        self.Kd = Kd
-        self.integral_error = 0
-        self.prev_error = 0
-        self.dt = 0.01  # 控制周期，需要与模拟步长相匹配
-
-    def calculate(self, target, current):
-        error = target - current
-        self.integral_error += error * self.dt
-        derivative = (error - self.prev_error) / self.dt
-        output = (self.Kp * error) + (self.Ki * self.integral_error) + (self.Kd * derivative)
-        self.prev_error = error
-        return output
-
 
 def main():
     parser = argparse.ArgumentParser(description="policy training args")
-    parser.add_argument("-s", "--sim", action="store_true", help="sim piper in mujoco")
-    
-    current_path = os.path.dirname(os.path.realpath(__file__))
-    
-    
+    parser.add_argument("--model-path", default=str(combined_xml), help="MuJoCo XML path.")
+    parser.add_argument("--no-render", action="store_true")
+    parser.add_argument("--prep-max-steps", type=int, default=None)
+    parser.add_argument("--fsm-max-steps", type=int, default=None)
+    parser.add_argument("--reset-steps", type=int, default=2000)
+    parser.add_argument(
+        "--box-mass",
+        "--box-mass-kg",
+        dest="box_mass_kg",
+        type=float,
+        default=None,
+        help="Override the simulated grasp-box mass in kilograms.",
+    )
     args = parser.parse_args()
 
-    
-    if True: #if args.sim
-        #current_path = os.path.dirname(os.path.realpath(__file__))
-        #model_path = os.path.join(current_path, '..', '..', 'piper_ros', 'src', 'piper_description', 'mujoco_model', 'piper_description.xml')
-        model_path = str(combined_xml)
-        controller = SimController(pid_controllers=[PIDController(0.01, 0, 0) for _ in range(8)], model_path=model_path)
-    else:
-        pass
+    controller = SimController(
+        pid_controllers=[],
+        model_path=args.model_path,
+        render=not args.no_render,
+    )
+    if args.box_mass_kg is not None:
+        set_box_mass(controller, args.box_mass_kg)
+        print(f"box_mass_kg={args.box_mass_kg}")
     
     fsmActor = FSMActor(controller=controller)
-    count = 0
-    target_angles = [0, 1.5, -0.3, 0, -0.7, 0, 0.03, -0.03]
+    target_angles = [0, 1.5, -0.3, 0, -0.7, 0, 0.06]
     controller.set_initial_position(target_angles)
     gripper_delta = 0.0001
     arm_delta = 0.001
-    inital_config = None
-    while target_angles[4]>-1.2:
+    prep_steps = 0
+    while (
+        target_angles[4] > -1.2
+        and (args.prep_max_steps is None or prep_steps < args.prep_max_steps)
+    ):
         controller.send_joint_angle_cmd(target_angles)
         controller.step()
-        if min(controller.get_force_left(), controller.get_force_right()) > 0.8:
+        print(controller.get_force_left())
+        if min(controller.get_force_left(), controller.get_force_right()) > 2:
             gripper_delta = 0
             #example joint 5 movement
             #target_angles[4] = -1.2
@@ -64,22 +55,26 @@ def main():
             if target_angles[4] > -1.2:
                 target_angles[4]-=arm_delta
         #example gripper movement
-        target_angles[6] -= gripper_delta
-        target_angles[7] += gripper_delta
-        if True and glfw.window_should_close(controller.viewer.window):
+        target_angles[6] = max(0.0, target_angles[6] - 2.0 * gripper_delta)
+        prep_steps += 1
+        if _window_should_close(controller):
             break 
         
         time.sleep(0.01)
-    inital_config = controller.get_joint_angle_cmd()
-    initial_force = controller.get_force_average()
+    initial_config = controller.get_joint_angle_cmd()
     increment = 0.00001
     iteration = 0
     total_iterations = 4
     converge_sum = 0
     stop = False
+    fsm_steps = 0
     print("iteration 1")
-    while iteration < total_iterations:
+    while (
+        iteration < total_iterations
+        and (args.fsm_max_steps is None or fsm_steps < args.fsm_max_steps)
+    ):
         fsmActor.step()
+        fsm_steps += 1
         if fsmActor.is_converged(10):
             #break
             pass
@@ -91,9 +86,9 @@ def main():
             print("slipped at " + str(val))
             converge_sum += val
             stop = True 
-            controller.send_joint_angle_cmd(inital_config)
+            controller.send_joint_angle_cmd(initial_config)
             i = 0
-            while(i<2000):
+            while(i < args.reset_steps):
                 controller.step()
                 i+=1
             iteration += 1
@@ -110,11 +105,16 @@ def main():
         elif not stop:
             fsmActor.loosen(increment)
         #print(controller.get_force_average())
-        if True and glfw.window_should_close(controller.viewer.window):
+        if _window_should_close(controller):
             break 
         time.sleep(0.01)
 
     print("converged at avg " + str((converge_sum / total_iterations)))
+
+
+def _window_should_close(controller) -> bool:
+    viewer = getattr(controller, "viewer", None)
+    return bool(viewer is not None and glfw.window_should_close(viewer.window))
     
 if __name__ == "__main__":
     main()

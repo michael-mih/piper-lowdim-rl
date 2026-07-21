@@ -126,10 +126,7 @@ def main() -> None:
     agent = PPOAgent.load(args.checkpoint, device=device)
     agent.model.eval()
 
-    expected_observation_dim = len(GraspPPOEnv.observation_names) * max(
-        1,
-        int(observation_config.frame_stack_size),
-    )
+    expected_observation_dim = len(GraspPPOEnv.observation_names)
     if agent.config.observation_dim != expected_observation_dim:
         raise ValueError(
             f"Checkpoint expects {agent.config.observation_dim} observations, "
@@ -217,7 +214,13 @@ def main() -> None:
             if not done:
                 print(
                     f"step={env.steps} "
-                    f"action={np.asarray(action).tolist()} reward={reward:.4f}"
+                    f"action={np.asarray(action).tolist()} reward={reward:.4f} "
+                    f"is_slipping={bool(info.get('is_slipping', False))} "
+                    f"slip_recovered={bool(info.get('slip_recovered', False))} "
+                    "force_delta_window=["
+                    f"{float(info.get('left_force_delta_window_n', 0.0)):.4f}, "
+                    f"{float(info.get('right_force_delta_window_n', 0.0)):.4f}] "
+                    f"upward_action={float(info.get('upward_action_magnitude', 0.0)):.4f}"
                 )
         print(f"termination_reason={info.get('reason') or 'unknown'}")
 

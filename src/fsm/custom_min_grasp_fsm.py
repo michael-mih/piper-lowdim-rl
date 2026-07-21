@@ -16,14 +16,26 @@ class FSMActor:
 
     def tighten(self, increment: float):
         c = list(self.controller.get_joint_angle_cmd())
-        c[6] -= increment
-        c[7] += increment
+        lo, _ = self._gripper_bounds()
+        c[6] = max(lo, c[6] - 2.0 * increment)
         self.controller.send_joint_angle_cmd(c)
+
     def loosen(self, increment: float):
         c = list(self.controller.get_joint_angle_cmd())
-        c[6] += increment
-        c[7] -= increment
+        _, hi = self._gripper_bounds()
+        c[6] = min(hi, c[6] + 2.0 * increment)
         self.controller.send_joint_angle_cmd(c)
+
+    def _gripper_bounds(self):
+        command_bounds = getattr(self.controller, "command_bounds", None)
+        if command_bounds and 6 in command_bounds:
+            lo, hi = command_bounds[6]
+            return float(lo), float(hi)
+
+        joint_bounds = getattr(self.controller, "joint_bounds", None)
+        if joint_bounds and len(joint_bounds) >= 14:
+            return float(joint_bounds[12]), float(joint_bounds[13])
+        return 0.0, 0.07
 
     def is_slip(self) -> bool:
         if self.controller.get_force_left() < 0.01 or self.controller.get_force_right() < 0.01:
@@ -61,4 +73,3 @@ class FSMActor:
         if self.min is None or self.controller.get_force_average() < self.min:
             self.min = self.controller.get_force_average()
         self.controller.step()
-

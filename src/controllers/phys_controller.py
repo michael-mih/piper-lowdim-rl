@@ -52,6 +52,10 @@ class PhysController(Controller):
         -2.0944, 2.0944,
         0.0, 0.07,
     ]
+    command_bounds = {
+        4: (-1.2, 1.1),
+        6: (0.0, 0.05),
+    }
     DEFAULT_GPR_MODEL_PATH = (
         Path(__file__).resolve().parents[2]
         / "feng"
@@ -455,7 +459,6 @@ class PhysController(Controller):
         self._stopped = False
         self._enabled = False
         self.max_arm_command_delta_rad = 0.02
-        self.max_gripper_command_delta_m = 0.001
         self.max_arm_tracking_error_rad = 0.05
         self.max_gripper_tracking_error_m = 0.005
 
@@ -509,8 +512,8 @@ class PhysController(Controller):
         if not all(math.isfinite(value) for value in values):
             self.emergency_stop()
             raise RuntimeError("Refusing a non-finite physical joint command")
-        for index, value in enumerate(values):
-            lo, hi = self.joint_bounds[index * 2:index * 2 + 2]
+        for index, (lo, hi) in self.command_bounds.items():
+            value = values[index]
             if not lo <= value <= hi:
                 self.emergency_stop()
                 raise RuntimeError(
@@ -518,13 +521,9 @@ class PhysController(Controller):
                     f"{value} not in [{lo}, {hi}]"
                 )
         arm_delta = max(abs(values[index] - self.target_angles[index]) for index in range(6))
-        gripper_delta = abs(values[6] - self.target_angles[6])
         if arm_delta > self.max_arm_command_delta_rad + 1e-9:
             self.emergency_stop()
             raise RuntimeError(f"Refusing arm command jump of {arm_delta:.6f} rad")
-        if gripper_delta > self.max_gripper_command_delta_m + 1e-9:
-            self.emergency_stop()
-            raise RuntimeError(f"Refusing gripper command jump of {gripper_delta:.6f} m")
         with self.ros._feedback_lock:
             actual = list(self.ros.current_positions)
         arm_tracking_error = max(abs(values[index] - actual[index]) for index in range(6))

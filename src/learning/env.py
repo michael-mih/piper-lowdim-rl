@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -13,12 +14,16 @@ import math
 @dataclass
 class ObservationConfig:
     min_force_threshold_n: float = 0.05
+    slip_drop_threshold_n: float = 0.25
+    slip_recovery_drop_tolerance_n: float = 0.10
+    slip_recovery_force_ratio: float = 0.75
+    slip_recovery_confirmation_steps: int = 2
+    slip_rearm_confirmation_steps: int = 3
     calibration_max_steps: int = 10000
     calibration_force_mode: str = "both"
     normalize: bool = True
     max_force_n: float = 5.0
     max_force_delta_n: float = 1.0
-    max_force_drop_n: float = 1.0
     max_stiffness_n_per_m: float = 1000.0
     max_gripper_gap_m: float = 0.07
     max_gripper_gap_delta_m: float = 0.005
@@ -29,7 +34,6 @@ class ObservationConfig:
     sensor_offset_range: float = 0.02
     sensor_noise_std: float = 0.01
     motor_offset_range: float = 0.01
-    frame_stack_size: int = 4
 
 ## GPR force estimate -> model returns desired delta
 ## GPR force estimate -> model returns desired delta fed into PID 
@@ -39,9 +43,12 @@ class ObservationConfig:
 @dataclass
 class RewardConfig:
     desired_force_min_n: float = 0.1
-    desired_force_max_n: float = 4.0
+    desired_force_max_n: float = 3.5
     terminate_force_n: float = 5.0
     force_penalty: float = -0.0004
+    slip_lift_penalty: float = -0.001
+    slip_recovery_bonus: float = 0.002
+    slip_recovery_bonus_min_lift_progress: float = 0.05
     lift_reward_height_m: float = 0.005
     lift_reward: float = 0.0008
     high_lift_reward_height_m: float = 0.015
@@ -111,7 +118,7 @@ class GraspPPOEnv:
     """
 
     num_actions = 2  # Continuous action vector: [joint5 delta, desired force].
-    policy_schema_version = 2
+    policy_schema_version = 5
     observation_names = (
         "left_force_n",
         "right_force_n",
@@ -120,11 +127,9 @@ class GraspPPOEnv:
         "gripper_gap_m",
         "gripper_gap_delta_m",
         "joint5_position",
-        "previous_desired_force_n",
         "force_error_integral_ns",
         "force_derivative_filtered_n_per_s",
-        "max_force_drop_n",
-        "max_relative_force_drop",
+        "is_slipping",
     )
 
     def __init__(
@@ -155,6 +160,16 @@ class GraspPPOEnv:
         self._motor_offset = 0.0
         self._previous_left_force = 0.0
         self._previous_right_force = 0.0
+        self._left_force_delta_buffer = deque((0.0, 0.0, 0.0), maxlen=3)
+        self._right_force_delta_buffer = deque((0.0, 0.0, 0.0), maxlen=3)
+        self._is_slipping_state = False
+        self._slip_recovered_this_step = False
+        self._slip_recovery_steps = 0
+        self._slip_detection_armed = True
+        self._slip_rearm_steps = 0
+        self._initial_joint5_position: Optional[float] = None
+        self._episode_max_lift_progress = 0.0
+        self._last_recovery_bonus_progress = 0.0
         self._previous_gripper_gap = 0.0
         self._previous_desired_force_n = self.env_config.desired_force_min_n
         self._max_force_drop_n = 0.0
@@ -162,8 +177,7 @@ class GraspPPOEnv:
         self._sustained_force_drop_n = 0.0
         self._joint5_lift_progress_rad = 0.0
         self._lifting_this_step = False
-        self._observation_frames: list[np.ndarray] = []
-
+        self._upward_action_magnitude = 0.0
         self.episode_force_sum = 0.0
         self.episode_force_samples = 0
         self.episode_peak_force = 0.0
@@ -171,10 +185,7 @@ class GraspPPOEnv:
 
     @property
     def observation_dim(self) -> int:
-        return len(self.observation_names) * max(
-            1,
-            int(self.observation_config.frame_stack_size),
-        )
+        return len(self.observation_names)
 
     def policy_metadata(self) -> Dict[str, Any]:
         return self.policy_metadata_for_configs(
@@ -191,7 +202,6 @@ class GraspPPOEnv:
         return {
             "schema_version": cls.policy_schema_version,
             "observation_names": list(cls.observation_names),
-            "frame_stack_size": int(observation_config.frame_stack_size),
             "normalize": bool(observation_config.normalize),
             "calibration": {
                 "min_force_threshold_n": observation_config.min_force_threshold_n,
@@ -202,7 +212,6 @@ class GraspPPOEnv:
             "normalization": {
                 "max_force_n": observation_config.max_force_n,
                 "max_force_delta_n": observation_config.max_force_delta_n,
-                "max_force_drop_n": observation_config.max_force_drop_n,
                 "max_gripper_gap_m": observation_config.max_gripper_gap_m,
                 "max_gripper_gap_delta_m": observation_config.max_gripper_gap_delta_m,
                 "max_force_error_integral_ns": observation_config.max_force_error_integral_ns,
@@ -234,7 +243,19 @@ class GraspPPOEnv:
         self._sustained_force_drop_n = 0.0
         self._joint5_lift_progress_rad = 0.0
         self._lifting_this_step = False
-        self._observation_frames.clear()
+        self._left_force_delta_buffer.clear()
+        self._left_force_delta_buffer.extend((0.0, 0.0, 0.0))
+        self._right_force_delta_buffer.clear()
+        self._right_force_delta_buffer.extend((0.0, 0.0, 0.0))
+        self._is_slipping_state = False
+        self._slip_recovered_this_step = False
+        self._slip_recovery_steps = 0
+        self._slip_detection_armed = True
+        self._slip_rearm_steps = 0
+        self._initial_joint5_position = None
+        self._episode_max_lift_progress = 0.0
+        self._last_recovery_bonus_progress = 0.0
+        self._upward_action_magnitude = 0.0
         self._sensor_offset = self._sample_offset(self.observation_config.sensor_offset_range)
         self._motor_offset = self._sample_offset(self.observation_config.motor_offset_range)
         actual_start = self.controller.get_joint_angles()
@@ -258,6 +279,9 @@ class GraspPPOEnv:
         self.controller.reset_force_pid()
         left_force, right_force = self._read_forces()
         actual = self.controller.get_joint_angles()
+        self._initial_joint5_position = float(
+            actual[self.env_config.joint5_index]
+        )
         self._previous_left_force = left_force
         self._previous_right_force = right_force
         self._previous_gripper_gap = abs(
@@ -304,7 +328,7 @@ class GraspPPOEnv:
         values = np.array([raw[name] for name in self.observation_names], dtype=np.float32)
         if not self.observation_config.normalize:
             self._commit_observation_history(raw)
-            return self._stack_observation(values)
+            return values
 
         normalized = np.array(
             [
@@ -324,10 +348,6 @@ class GraspPPOEnv:
                     self.observation_config.max_gripper_gap_delta_m,
                 ),
                 self._normalize_joint5(raw["joint5_position"]),
-                self._normalize_positive(
-                    raw["previous_desired_force_n"],
-                    self.env_config.desired_force_max_n,
-                ),
                 self._normalize_symmetric(
                     raw["force_error_integral_ns"],
                     self.observation_config.max_force_error_integral_ns,
@@ -336,11 +356,7 @@ class GraspPPOEnv:
                     raw["force_derivative_filtered_n_per_s"],
                     self.observation_config.max_force_derivative_n_per_s,
                 ),
-                self._normalize_positive(
-                    raw["max_force_drop_n"],
-                    self.observation_config.max_force_drop_n,
-                ),
-                self._normalize_positive(raw["max_relative_force_drop"], 1.0),
+                1.0 if raw["is_slipping"] else -1.0,
             ],
             dtype=np.float32,
         )
@@ -354,11 +370,11 @@ class GraspPPOEnv:
                 size=2,
             )
         self._commit_observation_history(raw)
-        frame = np.clip(normalized, -1.0, 1.0).astype(np.float32)
-        return self._stack_observation(frame)
+        return np.clip(normalized, -1.0, 1.0).astype(np.float32)
 
     def observation_dict(self) -> Dict[str, float]:
         left_force, right_force = self._read_forces()
+        #print(left_force - self._previous_left_force)
         actual = self.controller.get_joint_angles()
         gripper_gap = abs(float(actual[self.env_config.gripper_index]))
         return {
@@ -369,26 +385,15 @@ class GraspPPOEnv:
             "gripper_gap_m": gripper_gap,
             "gripper_gap_delta_m": gripper_gap - self._previous_gripper_gap,
             "joint5_position": float(actual[self.env_config.joint5_index]),
-            "previous_desired_force_n": self._previous_desired_force_n,
             "force_error_integral_ns": self.controller.force_error_integral,
             "force_derivative_filtered_n_per_s": self.controller.force_derivative_filtered,
-            "max_force_drop_n": self._max_force_drop_n,
-            "max_relative_force_drop": self._max_relative_force_drop,
+            "is_slipping": float(self._is_slipping_state),
         }
 
     def _commit_observation_history(self, raw: Dict[str, float]) -> None:
         self._previous_left_force = raw["left_force_n"]
         self._previous_right_force = raw["right_force_n"]
         self._previous_gripper_gap = raw["gripper_gap_m"]
-
-    def _stack_observation(self, frame: np.ndarray) -> np.ndarray:
-        stack_size = max(1, int(self.observation_config.frame_stack_size))
-        if not self._observation_frames:
-            self._observation_frames = [frame.copy() for _ in range(stack_size)]
-        else:
-            self._observation_frames.append(frame.copy())
-            self._observation_frames = self._observation_frames[-stack_size:]
-        return np.concatenate(self._observation_frames).astype(np.float32)
 
     def _calibrate_stiffness(self) -> Dict[str, Any]:
         command = self._current_command()
@@ -414,18 +419,11 @@ class GraspPPOEnv:
             if calibration_steps >= self.observation_config.calibration_max_steps:
                 raise RuntimeError("Max calibration steps reached")
 
-            previous_gap = self._gripper_gap(command)
             command[cfg.gripper_index] -= cfg.calibration_gripper_delta
-            command[cfg.gripper_index] = self._clamp_joint(
-                cfg.gripper_index,
-                command[cfg.gripper_index],
-            )
             self.controller.send_joint_angle_cmd(command)
             self._run_controller_steps(1)
 
-            command = self._current_command()
-            if self._gripper_gap(command) >= previous_gap:
-                break
+           
 
         left_force, right_force = self._read_forces()
         gap = max(self._gripper_gap(self._current_command()), self.observation_config.gripper_gap_epsilon_m)
@@ -458,56 +456,11 @@ class GraspPPOEnv:
 
         left_force, right_force = self._read_forces()
         average_force = 0.5 * (left_force + right_force)
-        minimum_force = min(left_force, right_force)
-        previous_minimum_force = min(
-            self._previous_left_force,
-            self._previous_right_force,
-        )
-        minimum_force_change = minimum_force - previous_minimum_force
-        contact_force_scale = max(cfg.contact_force_scale_n, 1e-8)
-        contact_confidence = float(
-            np.clip(minimum_force / contact_force_scale, 0.0, 1.0)
-        )
-        max_rewarded_force_change = max(0.0, cfg.max_rewarded_force_change_n)
-        rewarded_force_change = float(
-            np.clip(
-                minimum_force_change,
-                -max_rewarded_force_change,
-                max_rewarded_force_change,
-            )
-        )
-        self.episode_peak_force = max(
-            self.episode_peak_force,
-            left_force,
-            right_force,
-        )
-        if (
-            left_force >= cfg.desired_force_min_n
-            and right_force >= cfg.desired_force_min_n
-        ):
-            self.episode_force_sum += average_force
-            self.episode_force_samples += 1
-
-        episode_average_force = (
-            self.episode_force_sum / self.episode_force_samples
-            if self.episode_force_samples > 0
-            else average_force
-        )
+        
 
         reward = float(step_penalty)
-        reward += cfg.force_penalty * average_force
-        reward += (
-            cfg.lift_progress_reward_coef
-            * self._joint5_lift_progress_rad
-            * contact_confidence
-        )
-        reward += cfg.force_change_reward_coef * rewarded_force_change
-        if self._lifting_this_step:
-            force_drop_excess = max(
-                0.0,
-                self._sustained_force_drop_n - cfg.force_drop_tolerance_n,
-            )
-            reward -= cfg.force_drop_penalty_coef * force_drop_excess
+
+       
         terminated = False
         reason = None
 
@@ -525,26 +478,9 @@ class GraspPPOEnv:
 
         success = False
         if not terminated and self._is_success(left_force, right_force):
-            force_range = max(
-                cfg.success_force_max_n - cfg.desired_force_min_n,
-                1e-8,
-            )
-            normalized_peak_force = np.clip(
-                (self.episode_peak_force - cfg.desired_force_min_n) / force_range,
-                0.0,
-                1.0,
-            )
-            normalized_average_force = np.clip(
-                (episode_average_force - cfg.desired_force_min_n) / force_range,
-                0.0,
-                1.0,
-            )
-            force_cost = cfg.success_reward * (
-                cfg.peak_force_penalty_coef * normalized_peak_force**2
-                + cfg.average_force_penalty_coef * normalized_average_force**2
-            )
 
-            reward += cfg.success_reward - force_cost
+
+            reward += cfg.success_reward #- force_cost
             terminated = True
             success = True
             reason = "success"
@@ -558,15 +494,20 @@ class GraspPPOEnv:
             "left_force_n": left_force,
             "right_force_n": right_force,
             "episode_peak_force_n": self.episode_peak_force,
-            "episode_average_force_n": episode_average_force,
+            "episode_average_force_n": None,
             "max_force_drop_n": self._max_force_drop_n,
             "max_relative_force_drop": self._max_relative_force_drop,
             "sustained_force_drop_n": self._sustained_force_drop_n,
             "joint5_lift_progress_rad": self._joint5_lift_progress_rad,
-            "minimum_force_change_n": minimum_force_change,
-            "contact_confidence": contact_confidence,
+            "minimum_force_change_n": None,
+            "contact_confidence": None,
             "object_lift_height_m": None,
             "stiffness_n_per_m": self.stiffness_n_per_m,
+            "is_slipping": self._is_slipping_state,
+            "slip_recovered": self._slip_recovered_this_step,
+            "left_force_delta_window_n": sum(self._left_force_delta_buffer),
+            "right_force_delta_window_n": sum(self._right_force_delta_buffer),
+            "upward_action_magnitude": self._upward_action_magnitude,
         }
 
     def _is_success(self, left_force: float, right_force: float) -> bool:
@@ -587,6 +528,11 @@ class GraspPPOEnv:
 
     def _compute_height_reward(self, cfg: RewardConfig) -> float:
         rew = 0
+        is_slipping = self._is_slip()
+        if is_slipping and self._lifting_this_step:
+            rew += cfg.slip_lift_penalty * self._upward_action_magnitude
+        rew += self._compute_slip_recovery_bonus(cfg)
+
         if self.controller.ground_truth_pos == True:
             current_height = self.controller.sim.data.get_body_xpos(self.env_config.default_body_name)[2]
             delta_height = current_height - self._initial_object_height
@@ -601,12 +547,122 @@ class GraspPPOEnv:
         af = self.controller.get_force_average()
         current_j5_angle = self.controller.get_joint_angles()[4]
         #neg is higher angle
-        if af > cfg.desired_force_min_n:
+        if af > cfg.desired_force_min_n and not is_slipping:
             y = self._f_height_reward(current_j5_angle)
             rew+= y
 
         return rew
 
+    def _is_slip(self) -> bool:
+        left_force, right_force = self._read_forces()
+        self._left_force_delta_buffer.append(
+            left_force - self._previous_left_force
+        )
+        self._right_force_delta_buffer.append(
+            right_force - self._previous_right_force
+        )
+
+        cfg = self.observation_config
+        left_window_delta = sum(self._left_force_delta_buffer)
+        right_window_delta = sum(self._right_force_delta_buffer)
+        slip_detected = (
+            left_window_delta < -cfg.slip_drop_threshold_n
+            or right_window_delta < -cfg.slip_drop_threshold_n
+        )
+        no_new_drop = (
+            left_window_delta >= -cfg.slip_recovery_drop_tolerance_n
+            and right_window_delta >= -cfg.slip_recovery_drop_tolerance_n
+        )
+        bilateral_contact = (
+            left_force >= cfg.min_force_threshold_n
+            and right_force >= cfg.min_force_threshold_n
+        )
+        self._slip_recovered_this_step = False
+        if self._is_slipping_state:
+            if slip_detected:
+                self._slip_recovery_steps = 0
+                return True
+
+            recovery_force_threshold = max(
+                cfg.min_force_threshold_n,
+                cfg.slip_recovery_force_ratio * self._previous_desired_force_n,
+            )
+            bilateral_force_rebuilt = (
+                left_force >= recovery_force_threshold
+                and right_force >= recovery_force_threshold
+            )
+
+            if bilateral_force_rebuilt and no_new_drop:
+                self._slip_recovery_steps += 1
+            else:
+                self._slip_recovery_steps = 0
+
+            confirmation_steps = max(1, int(cfg.slip_recovery_confirmation_steps))
+            if self._slip_recovery_steps >= confirmation_steps:
+                self._is_slipping_state = False
+                self._slip_recovered_this_step = True
+                self._slip_recovery_steps = 0
+                self._slip_detection_armed = False
+                self._slip_rearm_steps = 0
+        elif self._slip_detection_armed:
+            if slip_detected:
+                self._is_slipping_state = True
+                self._slip_recovery_steps = 0
+        else:
+            if bilateral_contact and no_new_drop:
+                self._slip_rearm_steps += 1
+            else:
+                self._slip_rearm_steps = 0
+
+            rearm_steps = max(1, int(cfg.slip_rearm_confirmation_steps))
+            if self._slip_rearm_steps >= rearm_steps:
+                self._slip_detection_armed = True
+                self._slip_rearm_steps = 0
+        return self._is_slipping_state
+
+    def _compute_slip_recovery_bonus(self, cfg: RewardConfig) -> float:
+        progress = self._normalized_lift_progress(cfg)
+        self._episode_max_lift_progress = max(
+            self._episode_max_lift_progress,
+            progress,
+        )
+        if not self._slip_recovered_this_step:
+            return 0.0
+
+        required_progress = (
+            self._last_recovery_bonus_progress
+            + max(0.0, cfg.slip_recovery_bonus_min_lift_progress)
+        )
+        if self._episode_max_lift_progress < required_progress:
+            return 0.0
+
+        self._last_recovery_bonus_progress = self._episode_max_lift_progress
+        return cfg.slip_recovery_bonus
+
+    def _normalized_lift_progress(self, cfg: RewardConfig) -> float:
+        if self.controller.ground_truth_pos is True:
+            if self._initial_object_height is None or cfg.success_lift_height_m <= 0.0:
+                return 0.0
+            return max(
+                0.0,
+                (self._obj_height() - self._initial_object_height)
+                / cfg.success_lift_height_m,
+            )
+
+        initial_joint5 = self._initial_joint5_position
+        if initial_joint5 is None:
+            configured_start = self.env_config.initial_joint_angles
+            if configured_start is None:
+                return 0.0
+            initial_joint5 = float(configured_start[self.env_config.joint5_index])
+
+        success_distance = initial_joint5 - cfg.success_lift_angle
+        if success_distance <= 0.0:
+            return 0.0
+        current_joint5 = float(
+            self.controller.get_joint_angles()[self.env_config.joint5_index]
+        )
+        return max(0.0, (initial_joint5 - current_joint5) / success_distance)
 
     def _calibration_force_met(self, left_force: float, right_force: float) -> bool:
         
@@ -641,6 +697,7 @@ class GraspPPOEnv:
             joint5_position + action[0] * cfg.joint5_lift_delta_rad
         )
         self._lifting_this_step = requested_joint5 < joint5_position
+        self._upward_action_magnitude = max(float(action[0]), 0.0)
         next_command[cfg.joint5_index] = requested_joint5
 
         desired_force = cfg.desired_force_min_n + (
@@ -829,16 +886,23 @@ class GraspPPOEnv:
             raise ValueError("Physical and expected start poses must contain seven values")
         if not all(math.isfinite(float(value)) for value in (*actual, *expected)):
             raise RuntimeError("Physical start pose contains a non-finite value")
-        arm_error = max(abs(float(actual[i]) - float(expected[i])) for i in range(6))
-        gripper_error = abs(float(actual[6]) - float(expected[6]))
+        joint5_index = self.env_config.joint5_index
+        gripper_index = self.env_config.gripper_index
+        joint5_error = abs(
+            float(actual[joint5_index]) - float(expected[joint5_index])
+        )
+        gripper_error = abs(
+            float(actual[gripper_index]) - float(expected[gripper_index])
+        )
         if (
-            arm_error > self.env_config.physical_start_pose_tolerance_rad
+            joint5_error > self.env_config.physical_start_pose_tolerance_rad
             or gripper_error > self.env_config.physical_start_gripper_tolerance_m
         ):
             raise RuntimeError(
                 "Physical robot is not staged at the trained start pose. Move it with a "
                 "verified low-speed trajectory before running the policy. "
-                f"max_arm_error={arm_error:.6f} rad, gripper_error={gripper_error:.6f} m"
+                f"joint5_error={joint5_error:.6f} rad, "
+                f"gripper_error={gripper_error:.6f} m"
             )
 
     def _normalize_positive(self, value: float, maximum: float) -> float:
