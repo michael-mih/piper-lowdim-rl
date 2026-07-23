@@ -2,8 +2,9 @@ from controllers.controller import Controller
 
 
 class FSMActor:
-    slip_tolerance_N = 0.2
-    min_contact_force_N = 0.2
+    collapse_drop_threshold_N = 0.6
+    collapse_force_ratio = 0.5
+    contact_loss_threshold_N = 0.01
     convergence_tolerance_N = 0.01
 
     def __init__(self, controller: Controller):
@@ -50,23 +51,35 @@ class FSMActor:
         return 0.0, 0.07
 
     def is_slip(self) -> bool:
-        if self.controller.get_force_left() < 0.01 or self.controller.get_force_right() < 0.01:
-            return True
         if (
-            all(force < self.min_contact_force_N for force in self.three_force_buffer_left)
-            or all(force < self.min_contact_force_N for force in self.three_force_buffer_right)
+            self.controller.get_force_left() < self.contact_loss_threshold_N
+            and self.controller.get_force_right() < self.contact_loss_threshold_N
         ):
             return True
 
-        left_window_drop = (
-            self.three_force_buffer_left[-1] - self.three_force_buffer_left[0]
+        left_step_drop = (
+            self.three_force_buffer_left[1] - self.three_force_buffer_left[0]
         )
-        right_window_drop = (
-            self.three_force_buffer_right[-1] - self.three_force_buffer_right[0]
+        right_step_drop = (
+            self.three_force_buffer_right[1] - self.three_force_buffer_right[0]
+        )
+        left_force_collapsed = (
+            self.three_force_buffer_left[0]
+            < self.collapse_force_ratio * self.three_force_buffer_left[1]
+        )
+        right_force_collapsed = (
+            self.three_force_buffer_right[0]
+            < self.collapse_force_ratio * self.three_force_buffer_right[1]
         )
         return (
-            left_window_drop >= self.slip_tolerance_N
-            or right_window_drop >= self.slip_tolerance_N
+            (
+                left_step_drop > self.collapse_drop_threshold_N
+                and left_force_collapsed
+            )
+            and (
+                right_step_drop > self.collapse_drop_threshold_N
+                and right_force_collapsed
+            )
         )
     
     #1 step:0.01 sec, 100 steps:1sec ?
@@ -85,10 +98,10 @@ class FSMActor:
     
     def step(self):
         self.step_count += 1
-        self.controller.step()
         self.three_force_buffer_left.insert(0, self.controller.get_force_left())
         self.three_force_buffer_left = self.three_force_buffer_left[:3]
         self.three_force_buffer_right.insert(0, self.controller.get_force_right())
         self.three_force_buffer_right = self.three_force_buffer_right[:3]
         if self.min is None or self.controller.get_force_average() < self.min:
             self.min = self.controller.get_force_average()
+        self.controller.step()

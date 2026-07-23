@@ -14,7 +14,9 @@ import math
 @dataclass
 class ObservationConfig:
     min_force_threshold_n: float = 0.05
-    slip_drop_threshold_n: float = 0.25
+    slip_drop_threshold_n: float = 0.6
+    slip_collapse_force_ratio: float = 0.5
+    slip_contact_loss_threshold_n: float = 0.01
     slip_recovery_drop_tolerance_n: float = 0.10
     slip_recovery_force_ratio: float = 0.75
     slip_recovery_confirmation_steps: int = 2
@@ -66,9 +68,10 @@ class RewardConfig:
     lift_progress_reward_coef: float = 1.0
     contact_force_scale_n: float = 0.3
     max_force_efficiency_reward: float = 0.5
-    force_decrease_confirmation_steps: int = 3
-    desired_force_confirmation_tolerance_n: float = 0.1
-    lift_progress_confirmation_tolerance: float = 0.001
+    force_decrease_confirmation_steps: int = 4
+    desired_force_confirmation_tolerance_n: float = 0.3
+    desired_force_stability_tolerance_n: float = 0.05
+    lift_progress_confirmation_tolerance: float = 0.01
 
     ideal_force_mass_ratio = 0.15 / 0.05
     ratio_tolerance = 0.1
@@ -172,7 +175,7 @@ class GraspPPOEnv:
         self._initial_joint5_position: Optional[float] = None
         self._episode_max_lift_progress = 0.0
         self._last_recovery_bonus_progress = 0.0
-        self._lowest_confirmed_desired_force_n = self.env_config.desired_force_max_n
+        self._confirmed_desired_force_n = self.env_config.desired_force_max_n
         self._pending_desired_force_n: Optional[float] = None
         self._pending_force_decrease_steps = 0
         self._previous_reward_lift_progress = 0.0
@@ -261,7 +264,7 @@ class GraspPPOEnv:
         self._initial_joint5_position = None
         self._episode_max_lift_progress = 0.0
         self._last_recovery_bonus_progress = 0.0
-        self._lowest_confirmed_desired_force_n = self.env_config.desired_force_max_n
+        self._confirmed_desired_force_n = self.env_config.desired_force_max_n
         self._pending_desired_force_n = None
         self._pending_force_decrease_steps = 0
         self._previous_reward_lift_progress = 0.0
@@ -523,9 +526,10 @@ class GraspPPOEnv:
             "object_lift_height_m": None,
             "stiffness_n_per_m": self.stiffness_n_per_m,
             "is_slipping": self._is_slipping_state,
+            "desired_force_n": self._previous_desired_force_n,
             "force_efficiency_reward": force_efficiency_reward,
             "episode_force_efficiency_reward": self._compute_force_efficiency_reward(cfg),
-            "lowest_confirmed_desired_force_n": self._lowest_confirmed_desired_force_n,
+            "confirmed_desired_force_n": self._confirmed_desired_force_n,
             "pending_desired_force_n": self._pending_desired_force_n,
             "pending_force_decrease_steps": self._pending_force_decrease_steps,
             "slip_recovered": self._slip_recovered_this_step,
@@ -558,6 +562,7 @@ class GraspPPOEnv:
         is_slipping: bool,
         desired_force: float,
     ) -> float:
+        previous_efficiency_reward = self._compute_force_efficiency_reward(cfg)
         current_lift_progress = self._normalized_lift_progress(cfg)
         no_lift_progress_loss = (
             current_lift_progress + max(0.0, cfg.lift_progress_confirmation_tolerance)
@@ -567,7 +572,11 @@ class GraspPPOEnv:
 
         if is_slipping:
             self._clear_pending_force_decrease()
-            return 0.0
+            self._confirmed_desired_force_n = self.env_config.desired_force_max_n
+            return (
+                self._compute_force_efficiency_reward(cfg)
+                - previous_efficiency_reward
+            )
 
         bilateral_contact = (
             left_force >= self.observation_config.min_force_threshold_n
@@ -575,16 +584,48 @@ class GraspPPOEnv:
         )
         if not bilateral_contact or not no_lift_progress_loss:
             self._clear_pending_force_decrease()
-            return 0.0
+            self._confirmed_desired_force_n = self.env_config.desired_force_max_n
+            return (
+                self._compute_force_efficiency_reward(cfg)
+                - previous_efficiency_reward
+            )
 
-        tolerance = max(0.0, cfg.desired_force_confirmation_tolerance_n)
-        pending_force = self._pending_desired_force_n
-        if pending_force is not None and desired_force > pending_force + tolerance:
+        reduction_threshold = max(
+            0.0,
+            cfg.desired_force_confirmation_tolerance_n,
+        )
+        stability_tolerance = max(
+            0.0,
+            cfg.desired_force_stability_tolerance_n,
+        )
+        if desired_force > self._confirmed_desired_force_n + stability_tolerance:
             self._clear_pending_force_decrease()
-            pending_force = None
+            self._confirmed_desired_force_n = min(
+                desired_force,
+                self.env_config.desired_force_max_n,
+            )
+            return (
+                self._compute_force_efficiency_reward(cfg)
+                - previous_efficiency_reward
+            )
 
-        if desired_force <= self._lowest_confirmed_desired_force_n - tolerance:
-            if pending_force is None or desired_force <= pending_force - tolerance:
+        pending_force = self._pending_desired_force_n
+        if pending_force is not None:
+            if desired_force > pending_force + stability_tolerance:
+                self._clear_pending_force_decrease()
+                pending_force = None
+            else:
+                self._pending_desired_force_n = max(
+                    pending_force,
+                    desired_force,
+                )
+                pending_force = self._pending_desired_force_n
+
+        if desired_force <= self._confirmed_desired_force_n - reduction_threshold:
+            if (
+                pending_force is None
+                or desired_force <= pending_force - reduction_threshold
+            ):
                 self._pending_desired_force_n = desired_force
                 self._pending_force_decrease_steps = 0
 
@@ -592,7 +633,6 @@ class GraspPPOEnv:
             return 0.0
 
         if not self._lifting_this_step:
-            self._pending_force_decrease_steps = 0
             return 0.0
 
         self._pending_force_decrease_steps += 1
@@ -600,9 +640,8 @@ class GraspPPOEnv:
         if self._pending_force_decrease_steps < confirmation_steps:
             return 0.0
 
-        previous_efficiency_reward = self._compute_force_efficiency_reward(cfg)
         confirmed_force = self._pending_desired_force_n
-        self._lowest_confirmed_desired_force_n = confirmed_force
+        self._confirmed_desired_force_n = confirmed_force
         self._clear_pending_force_decrease()
         return (
             self._compute_force_efficiency_reward(cfg)
@@ -619,7 +658,7 @@ class GraspPPOEnv:
         confirmed_force_decrease = max(
             0.0,
             self.env_config.desired_force_max_n
-            - self._lowest_confirmed_desired_force_n,
+            - self._confirmed_desired_force_n,
         )
         reduction_fraction = np.clip(
             confirmed_force_decrease / desired_force_range,
@@ -676,9 +715,21 @@ class GraspPPOEnv:
         cfg = self.observation_config
         left_window_delta = sum(self._left_force_delta_buffer)
         right_window_delta = sum(self._right_force_delta_buffer)
-        slip_detected = (
-            left_window_delta < -cfg.slip_drop_threshold_n
-            or right_window_delta < -cfg.slip_drop_threshold_n
+        contact_collapsed = (
+            left_force < cfg.slip_contact_loss_threshold_n
+            and right_force < cfg.slip_contact_loss_threshold_n
+        )
+        abrupt_force_collapse = (
+            (
+                left_force - self._previous_left_force < -cfg.slip_drop_threshold_n
+                and left_force
+                < cfg.slip_collapse_force_ratio * self._previous_left_force
+            )
+            and (
+                right_force - self._previous_right_force < -cfg.slip_drop_threshold_n
+                and right_force
+                < cfg.slip_collapse_force_ratio * self._previous_right_force
+            )
         )
         no_new_drop = (
             left_window_delta >= -cfg.slip_recovery_drop_tolerance_n
@@ -689,11 +740,12 @@ class GraspPPOEnv:
             and right_force >= cfg.min_force_threshold_n
         )
         self._slip_recovered_this_step = False
-        if self._is_slipping_state:
-            if slip_detected:
-                self._slip_recovery_steps = 0
-                return True
+        if contact_collapsed or abrupt_force_collapse:
+            self._is_slipping_state = True
+            self._slip_recovery_steps = 0
+            return True
 
+        if self._is_slipping_state:
             recovery_force_threshold = max(
                 cfg.min_force_threshold_n,
                 cfg.slip_recovery_force_ratio * self._previous_desired_force_n,
@@ -715,11 +767,7 @@ class GraspPPOEnv:
                 self._slip_recovery_steps = 0
                 self._slip_detection_armed = False
                 self._slip_rearm_steps = 0
-        elif self._slip_detection_armed:
-            if slip_detected:
-                self._is_slipping_state = True
-                self._slip_recovery_steps = 0
-        else:
+        elif not self._slip_detection_armed:
             if bilateral_contact and no_new_drop:
                 self._slip_rearm_steps += 1
             else:

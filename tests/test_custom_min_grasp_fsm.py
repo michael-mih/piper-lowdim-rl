@@ -21,26 +21,69 @@ class ForceController:
         pass
 
 
+class ForceChangingController(ForceController):
+    def step(self):
+        self.left_force = 0.3
+
+
 class FSMActorTests(unittest.TestCase):
     def setUp(self):
         self.controller = ForceController()
         self.actor = FSMActor(self.controller)
         self.actor.reset_tracking()
 
-    def test_cumulative_force_drop_across_window_is_slip(self):
-        self.actor.three_force_buffer_left = [0.7, 0.85, 1.0]
+    def test_abrupt_force_collapse_is_slip(self):
+        self.actor.three_force_buffer_left = [0.39, 1.0, 1.0]
+        self.actor.three_force_buffer_right = [0.39, 1.0, 1.0]
 
         self.assertTrue(self.actor.is_slip())
 
-    def test_small_force_drop_is_not_slip(self):
-        self.actor.three_force_buffer_left = [0.85, 0.9, 1.0]
+    def test_unilateral_force_collapse_is_not_slip(self):
+        self.actor.three_force_buffer_left = [0.39, 1.0, 1.0]
 
         self.assertFalse(self.actor.is_slip())
 
-    def test_three_low_force_samples_are_slip(self):
+    def test_gradual_force_drop_is_not_slip(self):
+        self.actor.three_force_buffer_left = [0.4, 0.7, 1.0]
+
+        self.assertFalse(self.actor.is_slip())
+
+    def test_normal_force_oscillation_is_not_slip(self):
+        self.actor.three_force_buffer_left = [1.6, 2.0, 1.8]
+
+        self.assertFalse(self.actor.is_slip())
+
+    def test_large_drop_without_force_collapse_is_not_slip(self):
+        self.actor.three_force_buffer_left = [3.2, 4.0, 4.0]
+
+        self.assertFalse(self.actor.is_slip())
+
+    def test_low_but_nonzero_contact_is_not_slip(self):
         self.actor.three_force_buffer_right = [0.19, 0.18, 0.17]
+        self.controller.right_force = 0.17
+
+        self.assertFalse(self.actor.is_slip())
+
+    def test_contact_loss_is_slip(self):
+        self.controller.left_force = 0.009
+        self.controller.right_force = 0.009
 
         self.assertTrue(self.actor.is_slip())
+
+    def test_unilateral_contact_loss_is_not_slip(self):
+        self.controller.right_force = 0.009
+
+        self.assertFalse(self.actor.is_slip())
+
+    def test_step_samples_force_before_advancing_controller(self):
+        controller = ForceChangingController()
+        actor = FSMActor(controller)
+        actor.reset_tracking()
+
+        actor.step()
+
+        self.assertEqual(actor.three_force_buffer_left[0], 1.0)
+        self.assertEqual(controller.left_force, 0.3)
 
     def test_reset_tracking_discards_previous_trial(self):
         self.actor.three_force_buffer_left = [0.1, 0.5, 1.0]

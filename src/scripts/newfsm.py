@@ -45,8 +45,9 @@ def main():
     ):
         controller.send_joint_angle_cmd(target_angles)
         controller.step()
-        #print(controller.get_force_left())
-        if min(controller.get_force_left(), controller.get_force_right()) > 1.9:
+        # Start the minimum-force search from a grasp that can support the
+        # heaviest configured box, then loosen until a collapse is observed.
+        if min(controller.get_force_left(), controller.get_force_right()) > 3.0:
             gripper_delta = 0
             #example joint 5 movement
             #target_angles[4] = -1.2
@@ -78,15 +79,21 @@ def main():
         fsmActor.step()
         fsm_steps += 1
         if fsmActor.is_converged(10):
-            converged_force = fsmActor.min
-            print("stable minimum force: " + str(converged_force))
-            break
+            # The old FSM measured collapse rather than terminating when the
+            # running minimum temporarily plateaued.
+            pass
         if not stop:
             print("iteration " + str(iteration+1) + ", force: " + str(fsmActor.controller.get_force_average()))
         if fsmActor.is_slip():
             fsmActor.tighten(increment)
             val = (fsmActor.three_force_buffer_left[1] + fsmActor.three_force_buffer_right[1]) / 2
-            print("slipped at " + str(val))
+            print(
+                "slipped at "
+                f"{val}, current=["
+                f"{controller.get_force_left()}, {controller.get_force_right()}], "
+                f"left_window={fsmActor.three_force_buffer_left}, "
+                f"right_window={fsmActor.three_force_buffer_right}"
+            )
             converge_sum += val
             stop = True 
             controller.send_joint_angle_cmd(initial_config)

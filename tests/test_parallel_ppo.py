@@ -9,6 +9,7 @@ from learning.ppo import (
     PPOAgent,
     PPOConfig,
     ParallelPPOTrainer,
+    PPOTrainer,
     SubprocessVectorEnv,
 )
 from scripts.train_ppo_grasp import parse_args
@@ -36,6 +37,11 @@ class TinyEnv:
         info = {
             "left_force_n": 0.2,
             "right_force_n": 0.2,
+            "desired_force_n": 0.5 + self.worker_id,
+            "force_efficiency_reward": 0.1 if self.steps == 2 else 0.0,
+            "episode_force_efficiency_reward": 0.1 if self.steps >= 2 else 0.0,
+            "box_mass_kg": 0.03 + 0.3 * self.worker_id,
+            "is_slipping": False,
             "success": done,
             "truncated": False,
             "reason": "success" if done else None,
@@ -90,8 +96,38 @@ class SubprocessVectorEnvTests(unittest.TestCase):
             self.assertEqual(tuple(data["obs"].shape), (11, 2))
             self.assertEqual(tuple(data["act"].shape), (11, 1))
             self.assertEqual(rollout_info["episodes"], 3.0)
+            self.assertAlmostEqual(rollout_info["mean_efficiency_reward"], 0.1)
+            self.assertEqual(rollout_info["efficiency_confirmations"], 3.0)
+            self.assertEqual(len(rollout_info["mass_metrics"]), 3)
+            self.assertAlmostEqual(
+                rollout_info["mass_metrics"][0]["mean_desired_force_n"],
+                0.5,
+            )
         finally:
             env.close()
+
+    @unittest.skipIf(ppo.torch is None, "PyTorch is not installed")
+    def test_single_trainer_reports_efficiency_metrics(self):
+        env = TinyEnv(0)
+        config = PPOConfig(
+            observation_dim=2,
+            num_actions=1,
+            rollout_steps=3,
+            train_iters=1,
+            batch_size=3,
+        )
+        agent = PPOAgent(config)
+        trainer = PPOTrainer(env, agent, config)
+
+        _, rollout_info = trainer.collect_rollout()
+
+        self.assertAlmostEqual(rollout_info["mean_efficiency_reward"], 0.1)
+        self.assertEqual(rollout_info["efficiency_confirmations"], 1.0)
+        self.assertEqual(len(rollout_info["mass_metrics"]), 1)
+        self.assertAlmostEqual(
+            rollout_info["mass_metrics"][0]["mean_measured_force_n"],
+            0.2,
+        )
 
 
 class ParallelTrainingArgumentTests(unittest.TestCase):

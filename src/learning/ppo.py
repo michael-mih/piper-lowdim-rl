@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import math
 import multiprocessing as mp
 from pathlib import Path
 import traceback
@@ -51,6 +52,77 @@ def _discount_cumsum(values: np.ndarray, discount: float) -> np.ndarray:
         running = float(values[idx]) + discount * running
         result[idx] = running
     return result
+
+
+_MASS_METRIC_BIN_WIDTH_KG = 0.1
+
+
+def _summarize_mass_metrics(
+    episodes: Sequence[Dict[str, float]],
+) -> List[Dict[str, float]]:
+    bins: Dict[float, List[Dict[str, float]]] = {}
+    for episode in episodes:
+        mass_kg = float(episode["box_mass_kg"])
+        bin_min_kg = (
+            math.floor((mass_kg + 1e-9) / _MASS_METRIC_BIN_WIDTH_KG)
+            * _MASS_METRIC_BIN_WIDTH_KG
+        )
+        bins.setdefault(round(bin_min_kg, 6), []).append(episode)
+
+    summaries = []
+    for bin_min_kg, bin_episodes in sorted(bins.items()):
+        summaries.append(
+            {
+                "mass_bin_min_kg": bin_min_kg,
+                "mass_bin_max_kg": bin_min_kg + _MASS_METRIC_BIN_WIDTH_KG,
+                "episodes": float(len(bin_episodes)),
+                "success_rate": float(
+                    np.mean([episode["success"] for episode in bin_episodes])
+                ),
+                "slip_rate": float(
+                    np.mean([episode["slipped"] for episode in bin_episodes])
+                ),
+                "mean_desired_force_n": float(
+                    np.mean(
+                        [
+                            episode["mean_desired_force_n"]
+                            for episode in bin_episodes
+                        ]
+                    )
+                ),
+                "mean_measured_force_n": float(
+                    np.mean(
+                        [
+                            episode["mean_measured_force_n"]
+                            for episode in bin_episodes
+                        ]
+                    )
+                ),
+                "mean_efficiency_reward": float(
+                    np.mean(
+                        [
+                            episode["efficiency_reward"]
+                            for episode in bin_episodes
+                        ]
+                    )
+                ),
+            }
+        )
+    return summaries
+
+
+def _print_mass_metrics(mass_metrics: Sequence[Dict[str, float]]) -> None:
+    for metric in mass_metrics:
+        print(
+            "mass_bin_kg=[{mass_bin_min_kg:.1f},{mass_bin_max_kg:.1f}) "
+            "episodes={episodes:.0f} success_rate={success_rate:.3f} "
+            "slip_rate={slip_rate:.3f} "
+            "mean_desired_force_n={mean_desired_force_n:.3f} "
+            "mean_measured_force_n={mean_measured_force_n:.3f} "
+            "mean_efficiency_reward={mean_efficiency_reward:.3f}".format(
+                **metric
+            )
+        )
 
 
 if torch is not None:
@@ -523,7 +595,7 @@ class PPOTrainer:
         self.config = config or agent.config
         self.completed_episodes = 0
 
-    def collect_rollout(self) -> Tuple[Dict[str, "torch.Tensor"], Dict[str, float]]:
+    def collect_rollout(self) -> Tuple[Dict[str, "torch.Tensor"], Dict[str, Any]]:
         buffer = RolloutBuffer(
             observation_dim=self.config.observation_dim,
             num_actions=self.env.num_actions,
@@ -536,10 +608,17 @@ class PPOTrainer:
         episode_length = 0
         completed_returns = []
         completed_lengths = []
+        completed_efficiency_rewards = []
+        completed_mass_metrics: List[Dict[str, float]] = []
         successful_episode_forces = []
         recent_gripper_forces = deque(maxlen=5)
+        episode_desired_force_sum = 0.0
+        episode_measured_force_sum = 0.0
+        episode_force_samples = 0
+        episode_slipped = False
         successes = 0
         completed_episodes = 0
+        efficiency_confirmations = 0
 
         for step_idx in range(self.config.rollout_steps):
             action, log_prob, value = self.agent.step(obs)
@@ -550,6 +629,14 @@ class PPOTrainer:
                 float(info["left_force_n"]) + float(info["right_force_n"])
             )
             recent_gripper_forces.append(average_gripper_force)
+            episode_desired_force_sum += float(info.get("desired_force_n", 0.0))
+            episode_measured_force_sum += average_gripper_force
+            episode_force_samples += 1
+            episode_slipped = episode_slipped or bool(
+                info.get("is_slipping", False)
+            )
+            if float(info.get("force_efficiency_reward", 0.0)) > 0.0:
+                efficiency_confirmations += 1
 
             episode_return += reward
             episode_length += 1
@@ -565,8 +652,36 @@ class PPOTrainer:
                     completed_episodes += 1
                     completed_returns.append(episode_return)
                     completed_lengths.append(episode_length)
+                    completed_efficiency_rewards.append(
+                        float(info.get("episode_force_efficiency_reward", 0.0))
+                    )
                     success = bool(info.get("success", False))
                     successes += int(success)
+                    if (
+                        "box_mass_kg" in info
+                        and episode_force_samples > 0
+                    ):
+                        completed_mass_metrics.append(
+                            {
+                                "box_mass_kg": float(info["box_mass_kg"]),
+                                "success": float(success),
+                                "slipped": float(episode_slipped),
+                                "mean_desired_force_n": (
+                                    episode_desired_force_sum
+                                    / episode_force_samples
+                                ),
+                                "mean_measured_force_n": (
+                                    episode_measured_force_sum
+                                    / episode_force_samples
+                                ),
+                                "efficiency_reward": float(
+                                    info.get(
+                                        "episode_force_efficiency_reward",
+                                        0.0,
+                                    )
+                                ),
+                            }
+                        )
                     if success:
                         successful_episode_forces.append(float(np.mean(recent_gripper_forces)))
                     print(
@@ -577,6 +692,10 @@ class PPOTrainer:
                     episode_return = 0.0
                     episode_length = 0
                     recent_gripper_forces.clear()
+                    episode_desired_force_sum = 0.0
+                    episode_measured_force_sum = 0.0
+                    episode_force_samples = 0
+                    episode_slipped = False
 
         rollout_info = {
             "episodes": float(completed_episodes),
@@ -586,6 +705,13 @@ class PPOTrainer:
             "mean_success_gripper_force": (
                 float(np.mean(successful_episode_forces)) if successful_episode_forces else 0.0
             ),
+            "mean_efficiency_reward": (
+                float(np.mean(completed_efficiency_rewards))
+                if completed_efficiency_rewards
+                else 0.0
+            ),
+            "efficiency_confirmations": float(efficiency_confirmations),
+            "mass_metrics": _summarize_mass_metrics(completed_mass_metrics),
         }
         return buffer.get(self.config.device), rollout_info
 
@@ -598,12 +724,15 @@ class PPOTrainer:
                 "update={update} episodes={episodes:.0f} success_rate={success_rate:.3f} "
                 "mean_return={mean_return:.3f} mean_length={mean_length:.1f} "
                 "mean_success_gripper_force={mean_success_gripper_force:.3f} "
+                "mean_efficiency_reward={mean_efficiency_reward:.3f} "
+                "efficiency_confirmations={efficiency_confirmations:.0f} "
                 "kl={kl:.5f} entropy={entropy:.3f}".format(
                     update=update_idx + 1,
                     **rollout_info,
                     **update_info,
                 )
             )
+            _print_mass_metrics(rollout_info["mass_metrics"])
             if save_path is not None:
                 self.agent.save(save_path)
 
@@ -627,7 +756,7 @@ class ParallelPPOTrainer:
                 "contribute at least one sample"
             )
 
-    def collect_rollout(self) -> Tuple[Dict[str, "torch.Tensor"], Dict[str, float]]:
+    def collect_rollout(self) -> Tuple[Dict[str, "torch.Tensor"], Dict[str, Any]]:
         buffer = RolloutBuffer(
             observation_dim=self.config.observation_dim,
             num_actions=self.env.num_actions,
@@ -652,12 +781,19 @@ class ParallelPPOTrainer:
         recent_gripper_forces = [
             deque(maxlen=5) for _ in range(self.env.num_envs)
         ]
+        episode_desired_force_sums = [0.0 for _ in range(self.env.num_envs)]
+        episode_measured_force_sums = [0.0 for _ in range(self.env.num_envs)]
+        episode_force_samples = [0 for _ in range(self.env.num_envs)]
+        episode_slipped = [False for _ in range(self.env.num_envs)]
 
         completed_returns: List[float] = []
         completed_lengths: List[int] = []
+        completed_efficiency_rewards: List[float] = []
+        completed_mass_metrics: List[Dict[str, float]] = []
         successful_episode_forces: List[float] = []
         successes = 0
         completed_episodes = 0
+        efficiency_confirmations = 0
 
         while any(steps > 0 for steps in remaining_steps):
             active_indices = [
@@ -691,6 +827,17 @@ class ParallelPPOTrainer:
                     float(info["left_force_n"]) + float(info["right_force_n"])
                 )
                 recent_gripper_forces[worker_index].append(average_gripper_force)
+                episode_desired_force_sums[worker_index] += float(
+                    info.get("desired_force_n", 0.0)
+                )
+                episode_measured_force_sums[worker_index] += average_gripper_force
+                episode_force_samples[worker_index] += 1
+                episode_slipped[worker_index] = (
+                    episode_slipped[worker_index]
+                    or bool(info.get("is_slipping", False))
+                )
+                if float(info.get("force_efficiency_reward", 0.0)) > 0.0:
+                    efficiency_confirmations += 1
                 episode_returns[worker_index] += float(rewards[batch_index])
                 episode_lengths[worker_index] += 1
 
@@ -713,8 +860,36 @@ class ParallelPPOTrainer:
                 completed_episodes += 1
                 completed_returns.append(episode_returns[worker_index])
                 completed_lengths.append(episode_lengths[worker_index])
+                completed_efficiency_rewards.append(
+                    float(info.get("episode_force_efficiency_reward", 0.0))
+                )
                 success = bool(info.get("success", False))
                 successes += int(success)
+                if (
+                    "box_mass_kg" in info
+                    and episode_force_samples[worker_index] > 0
+                ):
+                    completed_mass_metrics.append(
+                        {
+                            "box_mass_kg": float(info["box_mass_kg"]),
+                            "success": float(success),
+                            "slipped": float(episode_slipped[worker_index]),
+                            "mean_desired_force_n": (
+                                episode_desired_force_sums[worker_index]
+                                / episode_force_samples[worker_index]
+                            ),
+                            "mean_measured_force_n": (
+                                episode_measured_force_sums[worker_index]
+                                / episode_force_samples[worker_index]
+                            ),
+                            "efficiency_reward": float(
+                                info.get(
+                                    "episode_force_efficiency_reward",
+                                    0.0,
+                                )
+                            ),
+                        }
+                    )
                 if success:
                     successful_episode_forces.append(
                         float(np.mean(recent_gripper_forces[worker_index]))
@@ -727,6 +902,10 @@ class ParallelPPOTrainer:
                 episode_returns[worker_index] = 0.0
                 episode_lengths[worker_index] = 0
                 recent_gripper_forces[worker_index].clear()
+                episode_desired_force_sums[worker_index] = 0.0
+                episode_measured_force_sums[worker_index] = 0.0
+                episode_force_samples[worker_index] = 0
+                episode_slipped[worker_index] = False
                 if remaining_steps[worker_index] > 0:
                     reset_indices.append(worker_index)
 
@@ -763,6 +942,13 @@ class ParallelPPOTrainer:
                 if successful_episode_forces
                 else 0.0
             ),
+            "mean_efficiency_reward": (
+                float(np.mean(completed_efficiency_rewards))
+                if completed_efficiency_rewards
+                else 0.0
+            ),
+            "efficiency_confirmations": float(efficiency_confirmations),
+            "mass_metrics": _summarize_mass_metrics(completed_mass_metrics),
         }
         return buffer.get(self.config.device), rollout_info
 
@@ -790,11 +976,14 @@ class ParallelPPOTrainer:
                 "update={update} episodes={episodes:.0f} success_rate={success_rate:.3f} "
                 "mean_return={mean_return:.3f} mean_length={mean_length:.1f} "
                 "mean_success_gripper_force={mean_success_gripper_force:.3f} "
+                "mean_efficiency_reward={mean_efficiency_reward:.3f} "
+                "efficiency_confirmations={efficiency_confirmations:.0f} "
                 "kl={kl:.5f} entropy={entropy:.3f}".format(
                     update=update_idx + 1,
                     **rollout_info,
                     **update_info,
                 )
             )
+            _print_mass_metrics(rollout_info["mass_metrics"])
             if save_path is not None:
                 self.agent.save(save_path)

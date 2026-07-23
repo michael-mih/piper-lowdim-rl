@@ -9,8 +9,7 @@ box_half_extents = "0.02 0.01 0.04"
 support_half_extents = "0.035 0.025 0.04"
 finger_pad_position = "0 -0.02 -0.0005"
 finger_pad_half_extents = "0.015 0.015 0.001"
-finger_pad_friction = "1.2 1.2 0.1 0.01 0.01"
-#finger_pad_friction = "1.0 1.0 0.1 0.01 0.01"
+finger_pad_friction = "1 1 0.1 0.01 0.01"
 
 
 current_path = os.path.dirname(os.path.realpath(__file__))
@@ -57,6 +56,8 @@ for position_actuator in actuator.findall("position"):
     if position_actuator.get("joint") in ("joint7", "joint8"):
         position_actuator.set("kp", "1000")
         position_actuator.set("forcelimited", "true")
+        # The old FSM used 2 N actuators, which cannot support the current
+        # 0.6 kg upper training mass even at the friction limit.
         position_actuator.set("forcerange", "-4 4")
 
 pad_names = []
@@ -181,14 +182,6 @@ ET.SubElement(
 contact = root.find("contact")
 if contact is None:
     contact = ET.SubElement(root, "contact")
-ET.SubElement(
-    contact,
-    "exclude",
-    {
-        "body1": "link7",
-        "body2": "link8",
-    },
-)
 for pad_name in pad_names:
     ET.SubElement(
         contact,
