@@ -474,7 +474,15 @@ class GraspPPOEnv:
             elif cfg.desired_force_max_n <= force < cfg.terminate_force_n:
                 reward += cfg.force_penalty
 
-        reward += self._compute_height_reward(cfg)
+        is_slipping = self._is_slip()
+        force_decrease_reward = self._compute_force_decrease_reward(
+            cfg,
+            left_force,
+            right_force,
+            is_slipping,
+        )
+        reward += force_decrease_reward
+        reward += self._compute_height_reward(cfg, is_slipping=is_slipping)
 
         success = False
         if not terminated and self._is_success(left_force, right_force):
@@ -504,6 +512,7 @@ class GraspPPOEnv:
             "object_lift_height_m": None,
             "stiffness_n_per_m": self.stiffness_n_per_m,
             "is_slipping": self._is_slipping_state,
+            "force_decrease_reward": force_decrease_reward,
             "slip_recovered": self._slip_recovered_this_step,
             "left_force_delta_window_n": sum(self._left_force_delta_buffer),
             "right_force_delta_window_n": sum(self._right_force_delta_buffer),
@@ -526,9 +535,35 @@ class GraspPPOEnv:
             and right_force < cfg.desired_force_max_n
         )
 
-    def _compute_height_reward(self, cfg: RewardConfig) -> float:
+    def _compute_force_decrease_reward(
+        self,
+        cfg: RewardConfig,
+        left_force: float,
+        right_force: float,
+        is_slipping: bool,
+    ) -> float:
+        if is_slipping:
+            return 0.0
+
+        previous_average_force = 0.5 * (
+            self._previous_left_force + self._previous_right_force
+        )
+        average_force = 0.5 * (left_force + right_force)
+        force_decrease = max(0.0, previous_average_force - average_force)
+        rewarded_force_decrease = min(
+            force_decrease,
+            max(0.0, cfg.max_rewarded_force_change_n),
+        )
+        return cfg.force_change_reward_coef * rewarded_force_decrease
+
+    def _compute_height_reward(
+        self,
+        cfg: RewardConfig,
+        is_slipping: Optional[bool] = None,
+    ) -> float:
         rew = 0
-        is_slipping = self._is_slip()
+        if is_slipping is None:
+            is_slipping = self._is_slip()
         if is_slipping and self._lifting_this_step:
             rew += cfg.slip_lift_penalty * self._upward_action_magnitude
         rew += self._compute_slip_recovery_bonus(cfg)

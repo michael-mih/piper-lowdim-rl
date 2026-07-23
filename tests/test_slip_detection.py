@@ -83,6 +83,40 @@ class SlipDetectionTests(unittest.TestCase):
 
         self.assertEqual(reward, 0.0)
 
+    def test_force_decrease_without_slip_is_rewarded(self):
+        config = RewardConfig()
+
+        reward = self.env._compute_force_decrease_reward(
+            config,
+            left_force=0.9,
+            right_force=0.9,
+            is_slipping=False,
+        )
+
+        self.assertAlmostEqual(reward, 0.1 * config.force_change_reward_coef)
+
+    def test_force_decrease_during_slip_is_not_rewarded(self):
+        reward = self.env._compute_force_decrease_reward(
+            RewardConfig(),
+            left_force=0.7,
+            right_force=1.0,
+            is_slipping=True,
+        )
+
+        self.assertEqual(reward, 0.0)
+
+    def test_force_decrease_reward_is_capped(self):
+        config = RewardConfig(max_rewarded_force_change_n=0.05)
+
+        reward = self.env._compute_force_decrease_reward(
+            config,
+            left_force=0.5,
+            right_force=0.5,
+            is_slipping=False,
+        )
+
+        self.assertAlmostEqual(reward, 0.05 * config.force_change_reward_coef)
+
     def test_increasing_bilateral_force_recovers_after_confirmation(self):
         config = RewardConfig()
         self.env._previous_desired_force_n = 1.0

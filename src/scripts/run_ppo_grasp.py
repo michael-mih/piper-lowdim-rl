@@ -9,7 +9,7 @@ from learning.ppo import PPOAgent
 
 
 # Change this value to set the simulated cube mass in kilograms.
-CUBE_MASS_KG = 0.2
+CUBE_MASS_KG = 0.05
 
 
 def set_sim_cube_mass(controller, mass_kg: float) -> None:
