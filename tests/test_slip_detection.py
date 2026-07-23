@@ -83,39 +83,104 @@ class SlipDetectionTests(unittest.TestCase):
 
         self.assertEqual(reward, 0.0)
 
-    def test_force_decrease_without_slip_is_rewarded(self):
-        config = RewardConfig()
-
-        reward = self.env._compute_force_decrease_reward(
-            config,
-            left_force=0.9,
-            right_force=0.9,
-            is_slipping=False,
-        )
-
-        self.assertAlmostEqual(reward, 0.1 * config.force_change_reward_coef)
-
-    def test_force_decrease_during_slip_is_not_rewarded(self):
-        reward = self.env._compute_force_decrease_reward(
+    def update_force_decrease_confirmation(self, desired_force, is_slipping=False):
+        return self.env._update_force_decrease_confirmation(
             RewardConfig(),
-            left_force=0.7,
-            right_force=1.0,
-            is_slipping=True,
+            left_force=self.controller.left_force,
+            right_force=self.controller.right_force,
+            is_slipping=is_slipping,
+            desired_force=desired_force,
         )
 
-        self.assertEqual(reward, 0.0)
+    def test_desired_force_decrease_is_recorded_after_confirmation(self):
+        self.env._lowest_confirmed_desired_force_n = 1.0
+        self.env._lifting_this_step = True
 
-    def test_force_decrease_reward_is_capped(self):
-        config = RewardConfig(max_rewarded_force_change_n=0.05)
+        self.update_force_decrease_confirmation(0.9)
+        self.update_force_decrease_confirmation(0.9)
+        self.assertAlmostEqual(self.env._lowest_confirmed_desired_force_n, 1.0)
+        reward = self.update_force_decrease_confirmation(0.9)
 
-        reward = self.env._compute_force_decrease_reward(
-            config,
-            left_force=0.5,
-            right_force=0.5,
-            is_slipping=False,
+        self.assertAlmostEqual(self.env._lowest_confirmed_desired_force_n, 0.9)
+        self.assertGreater(reward, 0.0)
+
+    def test_efficiency_reward_is_normalized_to_configured_maximum(self):
+        config = RewardConfig()
+        self.env._lowest_confirmed_desired_force_n = (
+            self.env.env_config.desired_force_min_n
         )
 
-        self.assertAlmostEqual(reward, 0.05 * config.force_change_reward_coef)
+        reward = self.env._compute_force_efficiency_reward(config)
+
+        self.assertAlmostEqual(reward, config.max_force_efficiency_reward)
+
+    def test_incremental_efficiency_rewards_telescope_to_total(self):
+        config = RewardConfig()
+        self.env._lifting_this_step = True
+        earned_reward = 0.0
+
+        for desired_force in (3.0, 2.0, 0.5):
+            for _ in range(config.force_decrease_confirmation_steps):
+                earned_reward += self.update_force_decrease_confirmation(
+                    desired_force
+                )
+
+        self.assertAlmostEqual(
+            earned_reward,
+            self.env._compute_force_efficiency_reward(config),
+        )
+        self.assertLessEqual(earned_reward, config.max_force_efficiency_reward)
+
+    def test_slip_cancels_pending_force_decrease(self):
+        self.env._lowest_confirmed_desired_force_n = 1.0
+        self.env._lifting_this_step = True
+        self.update_force_decrease_confirmation(0.8)
+
+        self.update_force_decrease_confirmation(0.8, is_slipping=True)
+
+        self.assertIsNone(self.env._pending_desired_force_n)
+        self.assertEqual(self.env._pending_force_decrease_steps, 0)
+
+    def test_force_decrease_requires_bilateral_contact(self):
+        self.env._lowest_confirmed_desired_force_n = 1.0
+        self.env._lifting_this_step = True
+        self.controller.left_force = 0.0
+
+        self.update_force_decrease_confirmation(0.8)
+        self.assertIsNone(self.env._pending_desired_force_n)
+
+    def test_force_decrease_requires_active_lifting(self):
+        self.env._lowest_confirmed_desired_force_n = 1.0
+
+        for _ in range(3):
+            self.update_force_decrease_confirmation(0.8)
+
+        self.assertEqual(self.env._pending_force_decrease_steps, 0)
+
+    def test_lost_lift_progress_cancels_pending_force_decrease(self):
+        self.env._lowest_confirmed_desired_force_n = 1.0
+        self.env._lifting_this_step = True
+        self.update_force_decrease_confirmation(0.8)
+
+        self.controller.joint5 = -0.75
+        self.update_force_decrease_confirmation(0.8)
+
+        self.assertIsNone(self.env._pending_desired_force_n)
+        self.assertEqual(self.env._pending_force_decrease_steps, 0)
+
+    def test_higher_force_does_not_replace_lowest_confirmed_force(self):
+        self.env._lowest_confirmed_desired_force_n = 1.0
+        self.env._lifting_this_step = True
+        for _ in range(3):
+            self.update_force_decrease_confirmation(0.8)
+        self.assertAlmostEqual(self.env._lowest_confirmed_desired_force_n, 0.8)
+
+        repeated_reward = 0.0
+        for desired_force in (1.0, 0.8, 0.8, 0.8):
+            repeated_reward += self.update_force_decrease_confirmation(desired_force)
+
+        self.assertAlmostEqual(self.env._lowest_confirmed_desired_force_n, 0.8)
+        self.assertEqual(repeated_reward, 0.0)
 
     def test_increasing_bilateral_force_recovers_after_confirmation(self):
         config = RewardConfig()

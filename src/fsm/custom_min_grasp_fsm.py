@@ -1,17 +1,29 @@
 from controllers.controller import Controller
+
+
 class FSMActor:
     slip_tolerance_N = 0.2
+    min_contact_force_N = 0.2
+    convergence_tolerance_N = 0.01
+
     def __init__(self, controller: Controller):
         self.controller = controller
         self.min = None
         self.min_checkpoint = None
-
         self.step_count = 0
         self.next_step_interval = 0
-        self.three_force_buffer_left = [0.0,0.0,0.0]
-        self.three_force_buffer_right = [0.0,0.0,0.0]
-        self.grip_delta = -0.6
-        
+        self.three_force_buffer_left = [0.0, 0.0, 0.0]
+        self.three_force_buffer_right = [0.0, 0.0, 0.0]
+
+    def reset_tracking(self):
+        left_force = self.controller.get_force_left()
+        right_force = self.controller.get_force_right()
+        self.three_force_buffer_left = [left_force] * 3
+        self.three_force_buffer_right = [right_force] * 3
+        self.min = self.controller.get_force_average()
+        self.min_checkpoint = None
+        self.step_count = 0
+        self.next_step_interval = 0
 
 
     def tighten(self, increment: float):
@@ -40,36 +52,43 @@ class FSMActor:
     def is_slip(self) -> bool:
         if self.controller.get_force_left() < 0.01 or self.controller.get_force_right() < 0.01:
             return True
-        l = 0
-        r = 0
-        for i in range(0, 3):
-            if self.three_force_buffer_left[i] < 0.2:
-                l +=1
-            if self.three_force_buffer_right[i] < 0.2:
-                r +=1
-            if l == 3 or r == 3:
-                pass
-            if self.three_force_buffer_left[0] - self.three_force_buffer_left[1] < self.grip_delta or self.three_force_buffer_right[0] - self.three_force_buffer_right[1] < self.grip_delta:
-                return True
-        return False
+        if (
+            all(force < self.min_contact_force_N for force in self.three_force_buffer_left)
+            or all(force < self.min_contact_force_N for force in self.three_force_buffer_right)
+        ):
+            return True
+
+        left_window_drop = (
+            self.three_force_buffer_left[-1] - self.three_force_buffer_left[0]
+        )
+        right_window_drop = (
+            self.three_force_buffer_right[-1] - self.three_force_buffer_right[0]
+        )
+        return (
+            left_window_drop >= self.slip_tolerance_N
+            or right_window_drop >= self.slip_tolerance_N
+        )
     
     #1 step:0.01 sec, 100 steps:1sec ?
     def is_converged(self, interval) -> bool:
-        interval *= 100
+        interval = max(1, int(interval * 100))
         if self.step_count >= self.next_step_interval:
-            if self.min_checkpoint is not None and self.min_checkpoint < self.controller.get_force_average():
-                return True
+            converged = (
+                self.min_checkpoint is not None
+                and abs(self.min_checkpoint - self.min)
+                <= self.convergence_tolerance_N
+            )
             self.next_step_interval = self.step_count + interval
             self.min_checkpoint = self.min
-            return False
+            return converged
+        return False
     
     def step(self):
         self.step_count += 1
-        
+        self.controller.step()
         self.three_force_buffer_left.insert(0, self.controller.get_force_left())
         self.three_force_buffer_left = self.three_force_buffer_left[:3]
         self.three_force_buffer_right.insert(0, self.controller.get_force_right())
         self.three_force_buffer_right = self.three_force_buffer_right[:3]
         if self.min is None or self.controller.get_force_average() < self.min:
             self.min = self.controller.get_force_average()
-        self.controller.step()

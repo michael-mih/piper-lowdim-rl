@@ -10,6 +10,7 @@ support_half_extents = "0.035 0.025 0.04"
 finger_pad_position = "0 -0.02 -0.0005"
 finger_pad_half_extents = "0.015 0.015 0.001"
 finger_pad_friction = "1.2 1.2 0.1 0.01 0.01"
+#finger_pad_friction = "1.0 1.0 0.1 0.01 0.01"
 
 
 current_path = os.path.dirname(os.path.realpath(__file__))

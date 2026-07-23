@@ -45,8 +45,8 @@ def main():
     ):
         controller.send_joint_angle_cmd(target_angles)
         controller.step()
-        print(controller.get_force_left())
-        if min(controller.get_force_left(), controller.get_force_right()) > 2:
+        #print(controller.get_force_left())
+        if min(controller.get_force_left(), controller.get_force_right()) > 1.9:
             gripper_delta = 0
             #example joint 5 movement
             #target_angles[4] = -1.2
@@ -68,6 +68,8 @@ def main():
     converge_sum = 0
     stop = False
     fsm_steps = 0
+    converged_force = None
+    fsmActor.reset_tracking()
     print("iteration 1")
     while (
         iteration < total_iterations
@@ -76,8 +78,9 @@ def main():
         fsmActor.step()
         fsm_steps += 1
         if fsmActor.is_converged(10):
-            #break
-            pass
+            converged_force = fsmActor.min
+            print("stable minimum force: " + str(converged_force))
+            break
         if not stop:
             print("iteration " + str(iteration+1) + ", force: " + str(fsmActor.controller.get_force_average()))
         if fsmActor.is_slip():
@@ -91,6 +94,7 @@ def main():
             while(i < args.reset_steps):
                 controller.step()
                 i+=1
+            fsmActor.reset_tracking()
             iteration += 1
             
             stop = False
@@ -109,7 +113,12 @@ def main():
             break 
         time.sleep(0.01)
 
-    print("converged at avg " + str((converge_sum / total_iterations)))
+    if converged_force is not None:
+        print("converged at " + str(converged_force))
+    elif iteration > 0:
+        print("average pre-slip force " + str(converge_sum / iteration))
+    else:
+        print("no convergence or slip detected")
 
 
 def _window_should_close(controller) -> bool:

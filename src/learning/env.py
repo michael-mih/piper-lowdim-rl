@@ -65,8 +65,10 @@ class RewardConfig:
     force_drop_penalty_coef: float = 0.01
     lift_progress_reward_coef: float = 1.0
     contact_force_scale_n: float = 0.3
-    force_change_reward_coef: float = 0.02
-    max_rewarded_force_change_n: float = 0.25
+    max_force_efficiency_reward: float = 0.5
+    force_decrease_confirmation_steps: int = 3
+    desired_force_confirmation_tolerance_n: float = 0.1
+    lift_progress_confirmation_tolerance: float = 0.001
 
     ideal_force_mass_ratio = 0.15 / 0.05
     ratio_tolerance = 0.1
@@ -170,6 +172,10 @@ class GraspPPOEnv:
         self._initial_joint5_position: Optional[float] = None
         self._episode_max_lift_progress = 0.0
         self._last_recovery_bonus_progress = 0.0
+        self._lowest_confirmed_desired_force_n = self.env_config.desired_force_max_n
+        self._pending_desired_force_n: Optional[float] = None
+        self._pending_force_decrease_steps = 0
+        self._previous_reward_lift_progress = 0.0
         self._previous_gripper_gap = 0.0
         self._previous_desired_force_n = self.env_config.desired_force_min_n
         self._max_force_drop_n = 0.0
@@ -255,6 +261,10 @@ class GraspPPOEnv:
         self._initial_joint5_position = None
         self._episode_max_lift_progress = 0.0
         self._last_recovery_bonus_progress = 0.0
+        self._lowest_confirmed_desired_force_n = self.env_config.desired_force_max_n
+        self._pending_desired_force_n = None
+        self._pending_force_decrease_steps = 0
+        self._previous_reward_lift_progress = 0.0
         self._upward_action_magnitude = 0.0
         self._sensor_offset = self._sample_offset(self.observation_config.sensor_offset_range)
         self._motor_offset = self._sample_offset(self.observation_config.motor_offset_range)
@@ -475,20 +485,21 @@ class GraspPPOEnv:
                 reward += cfg.force_penalty
 
         is_slipping = self._is_slip()
-        force_decrease_reward = self._compute_force_decrease_reward(
+        force_efficiency_reward = self._update_force_decrease_confirmation(
             cfg,
             left_force,
             right_force,
             is_slipping,
+            self._previous_desired_force_n,
         )
-        reward += force_decrease_reward
+        reward += force_efficiency_reward
         reward += self._compute_height_reward(cfg, is_slipping=is_slipping)
 
         success = False
         if not terminated and self._is_success(left_force, right_force):
 
 
-            reward += cfg.success_reward #- force_cost
+            reward += cfg.success_reward
             terminated = True
             success = True
             reason = "success"
@@ -512,7 +523,11 @@ class GraspPPOEnv:
             "object_lift_height_m": None,
             "stiffness_n_per_m": self.stiffness_n_per_m,
             "is_slipping": self._is_slipping_state,
-            "force_decrease_reward": force_decrease_reward,
+            "force_efficiency_reward": force_efficiency_reward,
+            "episode_force_efficiency_reward": self._compute_force_efficiency_reward(cfg),
+            "lowest_confirmed_desired_force_n": self._lowest_confirmed_desired_force_n,
+            "pending_desired_force_n": self._pending_desired_force_n,
+            "pending_force_decrease_steps": self._pending_force_decrease_steps,
             "slip_recovered": self._slip_recovered_this_step,
             "left_force_delta_window_n": sum(self._left_force_delta_buffer),
             "right_force_delta_window_n": sum(self._right_force_delta_buffer),
@@ -535,26 +550,87 @@ class GraspPPOEnv:
             and right_force < cfg.desired_force_max_n
         )
 
-    def _compute_force_decrease_reward(
+    def _update_force_decrease_confirmation(
         self,
         cfg: RewardConfig,
         left_force: float,
         right_force: float,
         is_slipping: bool,
+        desired_force: float,
     ) -> float:
+        current_lift_progress = self._normalized_lift_progress(cfg)
+        no_lift_progress_loss = (
+            current_lift_progress + max(0.0, cfg.lift_progress_confirmation_tolerance)
+            >= self._previous_reward_lift_progress
+        )
+        self._previous_reward_lift_progress = current_lift_progress
+
         if is_slipping:
+            self._clear_pending_force_decrease()
             return 0.0
 
-        previous_average_force = 0.5 * (
-            self._previous_left_force + self._previous_right_force
+        bilateral_contact = (
+            left_force >= self.observation_config.min_force_threshold_n
+            and right_force >= self.observation_config.min_force_threshold_n
         )
-        average_force = 0.5 * (left_force + right_force)
-        force_decrease = max(0.0, previous_average_force - average_force)
-        rewarded_force_decrease = min(
-            force_decrease,
-            max(0.0, cfg.max_rewarded_force_change_n),
+        if not bilateral_contact or not no_lift_progress_loss:
+            self._clear_pending_force_decrease()
+            return 0.0
+
+        tolerance = max(0.0, cfg.desired_force_confirmation_tolerance_n)
+        pending_force = self._pending_desired_force_n
+        if pending_force is not None and desired_force > pending_force + tolerance:
+            self._clear_pending_force_decrease()
+            pending_force = None
+
+        if desired_force <= self._lowest_confirmed_desired_force_n - tolerance:
+            if pending_force is None or desired_force <= pending_force - tolerance:
+                self._pending_desired_force_n = desired_force
+                self._pending_force_decrease_steps = 0
+
+        if self._pending_desired_force_n is None:
+            return 0.0
+
+        if not self._lifting_this_step:
+            self._pending_force_decrease_steps = 0
+            return 0.0
+
+        self._pending_force_decrease_steps += 1
+        confirmation_steps = max(1, int(cfg.force_decrease_confirmation_steps))
+        if self._pending_force_decrease_steps < confirmation_steps:
+            return 0.0
+
+        previous_efficiency_reward = self._compute_force_efficiency_reward(cfg)
+        confirmed_force = self._pending_desired_force_n
+        self._lowest_confirmed_desired_force_n = confirmed_force
+        self._clear_pending_force_decrease()
+        return (
+            self._compute_force_efficiency_reward(cfg)
+            - previous_efficiency_reward
         )
-        return cfg.force_change_reward_coef * rewarded_force_decrease
+
+    def _compute_force_efficiency_reward(self, cfg: RewardConfig) -> float:
+        desired_force_range = (
+            self.env_config.desired_force_max_n
+            - self.env_config.desired_force_min_n
+        )
+        if desired_force_range <= 0.0:
+            return 0.0
+        confirmed_force_decrease = max(
+            0.0,
+            self.env_config.desired_force_max_n
+            - self._lowest_confirmed_desired_force_n,
+        )
+        reduction_fraction = np.clip(
+            confirmed_force_decrease / desired_force_range,
+            0.0,
+            1.0,
+        )
+        return max(0.0, cfg.max_force_efficiency_reward) * float(reduction_fraction)
+
+    def _clear_pending_force_decrease(self) -> None:
+        self._pending_desired_force_n = None
+        self._pending_force_decrease_steps = 0
 
     def _compute_height_reward(
         self,
